@@ -66,7 +66,7 @@ jobs:
         run: |
           STRIP=${{ env.NDK_DIR }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
           if [ -f libs/arm64-v8a/libvirtualizer.so ]; then
-            cp libs/arm64-v8a/libvirtualizer.so libs/arm64-v8a/libvirtualizer unstripped.so
+            cp libs/arm64-v8a/libvirtualizer.so libs/arm64-v8a/libvirtualizer_unstripped.so
             $STRIP libs/arm64-v8a/libvirtualizer.so
             echo "Symbols stripped"
             ls -lh libs/arm64-v8a/libvirtualizer.so
@@ -111,34 +111,34 @@ jobs:
           cat > /tmp/release_notes.md << EOF
           ## Zygisk Virtualizer v${VERSION}
 
-          ### 📦 Module Installation
-          Download \`zygisk-virtualizer-v${VERSION}.zip\` and install via Magisk Manager:
-          1. Open Magisk Manager → Modules
-          2. Tap "Install from storage"
-          3. Select the downloaded .zip
-          4. Reboot
+           ### Module Installation
+           Download zygisk-virtualizer-v${VERSION}.zip and install via Magisk Manager:
+           1. Open Magisk Manager -> Modules
+           2. Tap "Install from storage"
+           3. Select the downloaded .zip
+           4. Reboot
 
-          ### 🔧 Manual ADB Installation
-          \`\`\`sh
-          adb push zygisk-virtualizer-v${VERSION}.zip /data/local/tmp/
-          adb shell su -c 'magisk --install-module /data/local/tmp/zygisk-virtualizer-v${VERSION}.zip'
-          adb reboot
-          \`\`\`
+           ### Manual ADB Installation
+           \`\`\`sh
+           adb push zygisk-virtualizer-v${VERSION}.zip /data/local/tmp/
+           adb shell su -c 'magisk --install-module /data/local/tmp/zygisk-virtualizer-v${VERSION}.zip'
+           adb reboot
+           \`\`\`
 
-          ### 📋 Zip Contents
-          - \`zygisk/arm64-v8a.so\` — Compiled Zygisk module (ARM64)
-          - \`module.prop\` — Magisk module metadata
-          - \`post-fs-data.sh\` — Boot-time cleanup script
-          - \`service.sh\` — Service watchdog script
+           ### Zip Contents
+           - zygisk/arm64-v8a.so - Compiled Zygisk module (ARM64)
+           - module.prop - Magisk module metadata
+           - post-fs-data.sh - Boot-time cleanup script
+           - service.sh - Service watchdog script
 
-          ### 🔗 Checksums
-          See \`*.md5\` and \`*.sha256\` files in the release assets.
+           ### Checksums
+           See *.md5 and *.sha256 files in the release assets.
 
-          ### ⚠️ Requirements
-          - Android 11+ (API 30)
-          - Linux kernel 5.0+ with SECCOMP_RET_USER_NOTIF support
-          - Magisk 27+ with Zygisk enabled
-          - ARM64 architecture
+           ### Requirements
+           - Android 11+ (API 30)
+           - Linux kernel 5.0+ with SECCOMP_RET_USER_NOTIF support
+           - Magisk 27+ with Zygisk enabled
+           - ARM64 architecture
           EOF
           echo "Release notes written to /tmp/release_notes.md"
 
@@ -155,3 +155,18 @@ jobs:
           generate_release_notes: false
           draft: false
           prerelease: false
+
+      - name: Auto-increment version for next release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VERSION="v${MAJOR}.${MINOR}.${NEXT_PATCH}"
+          echo "Current version: $VERSION"
+          echo "Next version: $NEXT_VERSION"
+          git config user.name "c4x64"
+          git config user.email "dev@zygisk-virtualizer.local"
+          git tag "$NEXT_VERSION" ${{ github.sha }}
+          git push origin "$NEXT_VERSION"
