@@ -66,6 +66,7 @@
 #include <type_traits>
 #include <utility>
 #include <algorithm>
+#include <sys/utsname.h>
 
 #define VIRT_LOG_TAG "Virtualizer"
 
@@ -1361,6 +1362,25 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "com.ramdroid.rootqueries",
     "com.topjohnwu.snet",
     "com.scottyab.rootbeer",
+    "/proc/self/pagemap",
+    "/proc/self/smaps",
+    "/proc/self/smaps_rollup",
+    "/proc/self/wchan",
+    "/proc/self/io",
+    "/proc/self/oom_score",
+    "/proc/self/oom_score_adj",
+    "/proc/self/mem",
+    "/proc/self/personality",
+    "/proc/self/stack",
+    "/proc/self/syscall",
+    "/proc/self/coredump_filter",
+    "/proc/self/task/",
+    "/sys/kernel/security/",
+    "/sys/fs/selinux/",
+    "/proc/self/mountinfo",
+    "/proc/self/mounts",
+    "/proc/self/exe",
+    "/proc/self/cmdline",
     NULL,
 };
 
@@ -1775,5 +1795,11 @@ void virt_print_hexdump(const void *data, size_t len, const char *label);
 
 int virt_detect_environment(void);
 int virt_check_environment_support(void);
+
+int virt_anti_tamper_loop(void *arg);
+int virt_spoof_uname(struct utsname *uts);
+int virt_is_safe_mode(void);
+void virt_log_event(const char *event_type, const char *path, int action);
+int virt_stats_dump_to_file(const char *filepath, const VIRT_SyscallStats *stats);
 
 #endif /* VIRTUALIZER_H */

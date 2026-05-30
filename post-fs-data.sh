@@ -1,11 +1,43 @@
 #!/system/bin/sh
 # post-fs-data.sh - Zygisk Virtualizer early boot setup
 
+MODDIR=/data/adb/modules/zygisk-virtualizer
+VIRT_DIR=/data/local/tmp/virtualizer
+
 # Create runtime directories
-mkdir -p /data/local/tmp/virtualizer
+mkdir -p $VIRT_DIR
+mkdir -p $VIRT_DIR/logs
+
+# Health check on boot: verify module files exist
+if [ ! -f $MODDIR/module.prop ]; then
+    echo "[!] Health check FAILED: module.prop missing" >> $VIRT_DIR/logs/boot.log 2>/dev/null || true
+fi
+if [ ! -f $MODDIR/zygisk/arm64-v8a.so ]; then
+    echo "[!] Health check FAILED: arm64-v8a.so missing" >> $VIRT_DIR/logs/boot.log 2>/dev/null || true
+    rm -f $MODDIR/zygisk/unloaded
+    echo -n > $MODDIR/disable
+    exit 1
+fi
+echo "[*] Health check passed: $(date)" >> $VIRT_DIR/logs/boot.log 2>/dev/null || true
+
+# Safe mode flag check: if Magisk created a disable flag during safe mode,
+# ensure we don't re-enable ourselves prematurely.
+if [ -f /cache/.disable_magisk ] || [ -f /data/unencrypted/.disable_magisk ] || [ -f /persist/.disable_magisk ]; then
+    echo "[!] Boot safe mode flag detected — keeping module disabled" >> $VIRT_DIR/logs/boot.log
+    echo -n > $MODDIR/disable
+    exit 1
+fi
+if [ -f /data/adb/ksu/.disable_ksu ]; then
+    echo "[!] KernelSU safe mode flag detected — keeping module disabled" >> $VIRT_DIR/logs/boot.log
+    echo -n > $MODDIR/disable
+    exit 1
+fi
+
+# Initial boot marker: record this boot timestamp
+date +%s > $VIRT_DIR/.last_boot 2>/dev/null || true
 
 # Remove stale Zygisk unloaded flag from previous boot
-rm -f /data/adb/modules/zygisk-virtualizer/zygisk/unloaded
+rm -f $MODDIR/zygisk/unloaded
 
 # Remove stale zygote marker so the first real zygote creates it fresh
 rm -f /data/local/tmp/.virt_zygote_marker
@@ -17,4 +49,4 @@ if [ -n "$KSU" ] || [ -n "$APATCH" ]; then
 fi
 
 # Set proper SELinux context
-chcon u:object_r:tmpfs:s0 /data/local/tmp/virtualizer 2>/dev/null || true
+chcon u:object_r:tmpfs:s0 $VIRT_DIR 2>/dev/null || true

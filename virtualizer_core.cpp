@@ -843,6 +843,15 @@ int virt_anti_tamper_check(VIRT_AntiTamperState *state) {
     return state->last_check_result;
 }
 
+int virt_is_safe_mode(void) {
+    struct stat st;
+    if (stat("/cache/.disable_magisk", &st) == 0) return 1;
+    if (stat("/data/unencrypted/.disable_magisk", &st) == 0) return 1;
+    if (stat("/persist/.disable_magisk", &st) == 0) return 1;
+    if (stat("/data/adb/ksu/.disable_ksu", &st) == 0) return 1;
+    return 0;
+}
+
 int virt_anti_tamper_detect_debugger(void) {
     char buf[256];
     int fd = open("/proc/self/status", O_RDONLY);
@@ -1506,6 +1515,93 @@ int virt_check_environment_support(void) {
     }
 }
 
+int virt_stats_dump_to_file(const char *filepath, const VIRT_SyscallStats *stats) {
+    if (!filepath || !stats) return VIRT_ERR_INVAL;
+
+    char buf[8192];
+    int len = virt_stats_snapshot(stats, buf, sizeof(buf));
+    if (len < 0) return VIRT_ERR_GENERIC;
+
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return VIRT_ERR_GENERIC;
+    ssize_t written = write(fd, buf, (size_t)len);
+    close(fd);
+    return (written == len) ? VIRT_OK : VIRT_ERR_GENERIC;
+}
+
+static pthread_mutex_t g_virt_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void virt_log_event(const char *event_type, const char *path, int action) {
+    if (!event_type || !path) return;
+
+    const char *log_dir = "/data/local/tmp/virtualizer";
+    const char *log_file = "/data/local/tmp/virtualizer/events.log";
+    const size_t max_lines = 10000;
+
+    pthread_mutex_lock(&g_virt_log_lock);
+
+    mkdir(log_dir, 0755);
+
+    uint64_t now_ns = virt_gettime_realtime_ns();
+    time_t sec = (time_t)(now_ns / 1000000000ULL);
+    struct tm tm;
+    localtime_r(&sec, &tm);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm);
+
+    const char *action_name = "unknown";
+    for (size_t i = 0; i < ARRAY_COUNT(ACTION_TABLE); i++) {
+        if (ACTION_TABLE[i].action == action) {
+            action_name = ACTION_TABLE[i].name;
+            break;
+        }
+    }
+    if (action == VIRT_ACTION_REDIRECT_PATH) action_name = "redirect";
+    else if (action == VIRT_ACTION_FAKE_CONTENT) action_name = "fake-content";
+    else if (action == VIRT_ACTION_FAKE_EMPTY) action_name = "fake-empty";
+    else if (action == VIRT_ACTION_FAKE_MAPS) action_name = "fake-maps";
+    else if (action == VIRT_ACTION_FAKE_STATUS) action_name = "fake-status";
+
+    FILE *f = fopen(log_file, "a+");
+    if (!f) { pthread_mutex_unlock(&g_virt_log_lock); return; }
+
+    fprintf(f, "[%s] %s: %s\n", timestamp, action_name, path);
+    fflush(f);
+
+    long line_count = 0;
+    fseek(f, 0, SEEK_SET);
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') line_count++;
+    }
+
+    if ((unsigned long)line_count > max_lines) {
+        fclose(f);
+
+        char tmp_path[VIRT_PATH_BUF_SIZE];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", log_file);
+        int src_fd = open(log_file, O_RDONLY);
+        int dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (src_fd >= 0 && dst_fd >= 0) {
+            long skip_lines = line_count - (long)(max_lines / 2);
+            int fd_c;
+            long lc = 0;
+            char ch;
+            while ((fd_c = (int)read(src_fd, &ch, 1)) > 0) {
+                if (lc >= skip_lines) write(dst_fd, &ch, 1);
+                if (ch == '\n') lc++;
+            }
+        }
+        if (src_fd >= 0) close(src_fd);
+        if (dst_fd >= 0) close(dst_fd);
+        rename(tmp_path, log_file);
+    } else {
+        fclose(f);
+    }
+
+    pthread_mutex_unlock(&g_virt_log_lock);
+}
+
 int virt_decoy_init(VIRT_Config *cfg) {
     if (!cfg) return VIRT_ERR_INVAL;
     if (!cfg->enable_file_decoy) {
@@ -1527,5 +1623,65 @@ int virt_decoy_init(VIRT_Config *cfg) {
     VIRT_LOGI("File decoy: maps=%s status=%s",
               g_decoy_maps_loaded ? "loaded" : "unavailable",
               g_decoy_status_loaded ? "loaded" : "unavailable");
+    return VIRT_OK;
+}
+
+int virt_anti_tamper_loop(void *arg) {
+    (void)arg;
+    prctl(PR_SET_NAME, "anti-tamper", 0, 0, 0);
+    VIRT_AntiTamperState state;
+    virt_anti_tamper_init(&state);
+
+    VIRT_LOGI("Anti-tamper loop started (interval=30s)");
+    while (1) {
+        struct timespec ts = { .tv_sec = 30, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+
+        int dbg = virt_anti_tamper_detect_debugger();
+        int pt  = virt_anti_tamper_detect_ptrace();
+        int hk  = virt_anti_tamper_detect_hook();
+
+        if (dbg > 0 || pt > 0 || hk > 0) {
+            VIRT_LOGW("Anti-tamper: dbg=%d pt=%d hooks=%d", dbg, pt, hk);
+        }
+
+        virt_anti_tamper_check_memory(&state);
+        virt_anti_tamper_check_code(&state);
+
+        int fd = open("/proc/self/maps", O_RDONLY);
+        if (fd >= 0) {
+            char buf[4096];
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                if (strstr(buf, "frida") || strstr(buf, "xposed") ||
+                    strstr(buf, "gadget") || strstr(buf, "substrate")) {
+                    VIRT_LOGW("Anti-tamper: detection tool found in maps!");
+                }
+            }
+        }
+
+        state.total_checks++;
+        state.last_check_ns = virt_gettime_ns();
+    }
+    return 0;
+}
+
+int virt_spoof_uname(struct utsname *uts) {
+    if (!uts) return VIRT_ERR_INVAL;
+    static const char *fake_sysname  = "Linux";
+    static const char *fake_nodename = "localhost";
+    static const char *fake_release  = "4.19.157-perf+";
+    static const char *fake_version  = "#1 SMP PREEMPT Thu Jan 1 00:00:00 UTC 1970";
+    static const char *fake_machine  = "aarch64";
+    virt_safe_strncpy(uts->sysname,  fake_sysname,  sizeof(uts->sysname));
+    virt_safe_strncpy(uts->nodename, fake_nodename, sizeof(uts->nodename));
+    virt_safe_strncpy(uts->release,  fake_release,  sizeof(uts->release));
+    virt_safe_strncpy(uts->version,  fake_version,  sizeof(uts->version));
+    virt_safe_strncpy(uts->machine,  fake_machine,  sizeof(uts->machine));
+#ifdef _GNU_SOURCE
+    virt_safe_strncpy(uts->domainname, "(none)", sizeof(uts->domainname));
+#endif
     return VIRT_OK;
 }

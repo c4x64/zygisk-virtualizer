@@ -1,0 +1,6 @@
+# Zygisk Virtualizer - Allow seccomp and ptrace for injection
+allow zygote zygote_tmpfs:file { read write open };
+allow zygote appdomain:fd use;
+allow zygote appdomain:process { ptrace sigchld };
+allow zygote appdomain:file { read open getattr };
+allow zygote appdomain:socket { read write ioctl };

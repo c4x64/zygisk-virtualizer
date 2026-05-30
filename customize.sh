@@ -32,6 +32,26 @@ esac
 ui_print "- Extracting module files"
 unzip -o "$ZIPFILE" -d "$MODPATH" >/dev/null 2>&1
 
+# Handle sepolicy.rule for KernelSU/APatch
+if [ -f "$MODPATH/sepolicy.rule" ]; then
+    if [ "$ENVIRONMENT" = "KernelSU" ] || [ "$ENVIRONMENT" = "APatch" ]; then
+        ui_print "- Deploying sepolicy.rule"
+    else
+        ui_print "- Removing sepolicy.rule (Magisk - not needed)"
+        rm -f "$MODPATH/sepolicy.rule"
+    fi
+fi
+
+# Handle WebUI (KernelSU only)
+if [ -d "$MODPATH/webui" ]; then
+    if [ "$ENVIRONMENT" = "KernelSU" ]; then
+        ui_print "- WebUI support enabled"
+    else
+        ui_print "- Removing WebUI (Magisk/APatch - not supported)"
+        rm -rf "$MODPATH/webui"
+    fi
+fi
+
 # Check for Zygisk support
 if [ -d "$MODPATH/zygisk" ]; then
     ui_print "- Zygisk variant detected"
@@ -41,6 +61,9 @@ if [ -d "$MODPATH/zygisk" ]; then
         ui_print "! Module will still be installed but may be inactive"
     fi
 fi
+
+# Mark zygote marker for Kitsune detection
+touch /data/local/tmp/.virt_zygote_marker 2>/dev/null
 
 # Set permissions
 set_perm_recursive $MODPATH 0 0 0755 0644

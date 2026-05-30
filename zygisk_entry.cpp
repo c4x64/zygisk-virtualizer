@@ -225,6 +225,11 @@ public:
             rt_env == VIRT_ENV_KERNELSU ? "KernelSU" :
             rt_env == VIRT_ENV_APATCH ? "APatch" : "Unknown");
 
+        if (virt_is_safe_mode()) {
+            VIRT_ZYGISK_LOGW("Safe mode detected — disabling seccomp virtualization");
+            return;
+        }
+
         VIRT_ZYGISK_LOGI(
             "Virtualizer v%s loaded (load_count=%u, kernel_features=0x%x, env=%s)",
             VIRTUALIZER_VERSION,

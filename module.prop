@@ -5,3 +5,4 @@ versionCode=100
 author=droid-re-chain
 description=SECCOMP-based path virtualization module that hides root/magisk/frida/xposed traces from detection. Supports Magisk 27+, KernelSU, APatch, and ZygiskNext.
 minMagisk=27000
+webUi=webui/index.html

@@ -22,6 +22,17 @@ static VIRT_ProcHiderState *g_seccomp_engine_proc_hider = NULL;
 
 const char *VIRT_DECOY_MAPS_PATH = "/data/local/tmp/clean_maps";
 const char *VIRT_DECOY_STATUS_PATH = "/data/local/tmp/clean_status";
+const char *VIRT_DECOY_MOUNTINFO_PATH = "/data/local/tmp/clean_mountinfo";
+
+static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
+    "1 0 0:0 / / rw,relatime shared:1 - rootfs rootfs rw",
+    "2 1 0:1 / /dev rw,nosuid,relatime shared:2 - devtmpfs devtmpfs rw",
+    "3 1 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:3 - proc proc rw",
+    "4 1 0:4 / /sys rw,nosuid,nodev,noexec,relatime shared:4 - sysfs sysfs rw",
+    "5 1 0:5 / /system rw,relatime shared:5 - ext4 mmcblk0p43 rw",
+    "6 1 0:6 / /data rw,nosuid,nodev,noatime shared:6 - ext4 mmcblk0p44 rw",
+    NULL,
+};
 
 bool virt_decoy_file_create(const char *path, const char *const *lines) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -367,6 +378,10 @@ int virt_seccomp_create_decoy_files(void) {
     }
     if (virt_decoy_file_create(VIRT_DECOY_STATUS_PATH, VIRT_FAKE_STATUS_CONTENT)) {
         VIRT_LOGD("Decoy status created at %s", VIRT_DECOY_STATUS_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_MOUNTINFO_PATH, VIRT_FAKE_MOUNTINFO_CONTENT)) {
+        VIRT_LOGD("Decoy mountinfo created at %s", VIRT_DECOY_MOUNTINFO_PATH);
         ok++;
     }
     return ok;
@@ -912,12 +927,16 @@ int virt_seccomp_handler_loop(void *arg) {
             action != VIRT_ACTION_PASS_THROUGH &&
             action != VIRT_ACTION_ALLOW) {
             health.blocked_events++;
+            virt_log_event("block", path_buf, action);
             if (req.data.nr == __NR_openat || req.data.nr == __NR_openat2) {
                 if (strstr(path_buf, "maps"))
                     redirect_path = VIRT_DECOY_MAPS_PATH;
                 else if (strstr(path_buf, "status") ||
                          strstr(path_buf, "stat"))
                     redirect_path = VIRT_DECOY_STATUS_PATH;
+                else if (strstr(path_buf, "mountinfo") ||
+                         strstr(path_buf, "mounts"))
+                    redirect_path = VIRT_DECOY_MOUNTINFO_PATH;
                 if (redirect_path) {
                     int new_fd = virt_seccomp_try_addfd(notify_fd, &req,
                                                          redirect_path);
@@ -928,6 +947,41 @@ int virt_seccomp_handler_loop(void *arg) {
                                       path_buf, new_fd);
                     }
                 }
+            }
+        }
+
+        /* --- /proc/self/exe readlink Spoofing ---
+         * When an app reads /proc/self/exe via readlink/readlinkat,
+         * return a cleaned path that strips any Magisk mount overlay. */
+        if (!should_redirect && path_readable &&
+            (req.data.nr == __NR_readlinkat || req.data.nr == __NR_readlink)) {
+            size_t pl = strlen(path_buf);
+            if (pl >= 4 && strcmp(path_buf + pl - 4, "/exe") == 0) {
+                const char *clean_path = "/system/bin/app_process64";
+                size_t clean_len = strlen(clean_path);
+                uint64_t buf_addr = (req.data.nr == __NR_readlinkat)
+                    ? req.data.args[2] : req.data.args[1];
+                uint64_t buf_size = (req.data.nr == __NR_readlinkat)
+                    ? req.data.args[3] : req.data.args[2];
+                size_t write_size = VIRT_MIN(clean_len, (size_t)buf_size);
+                if (write_size > 0) {
+                    struct iovec lw = { .iov_base = (void *)clean_path,
+                                        .iov_len = write_size };
+                    struct iovec rw = { .iov_base = (void *)(uintptr_t)buf_addr,
+                                        .iov_len = write_size };
+                    syscall(__NR_process_vm_writev, (pid_t)req.pid,
+                            &lw, 1UL, &rw, 1UL, 0UL);
+                }
+                resp.id = req.id;
+                resp.error = 0;
+                resp.val = (__s64)write_size;
+                resp.flags = 0;
+                rc = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+                if (rc < 0 && errno == ENOENT) { continue; }
+                VIRT_LOGD("[readlink] SPOOF /proc/self/exe -> %s (%zu bytes)",
+                          clean_path, write_size);
+                action = VIRT_ACTION_ALLOW;
+                /* fall through to stats recording */
             }
         }
 
@@ -1025,6 +1079,10 @@ int virt_seccomp_handler_loop(void *arg) {
             char stats_buf[2048];
             virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
             VIRT_LOGI("Periodic stats:\n%s", stats_buf);
+        }
+
+        if (health.processed_events % 1000 == 0) {
+            virt_stats_dump_to_file("/data/local/tmp/virtualizer/stats.txt", stats);
         }
     }
 

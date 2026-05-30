@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zygisk Virtualizer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Zygisk Virtualizer</h1>
+    <p class="subtitle">SECCOMP Path Virtualization Engine</p>
+  </header>
+
+  <section class="card status-card">
+    <h2>Module Status</h2>
+    <div class="status-row">
+      <span class="label">Service</span>
+      <span class="status-badge" id="serviceStatus">Checking...</span>
+    </div>
+    <div class="status-row">
+      <span class="label">Zygisk</span>
+      <span class="status-badge" id="zygiskStatus">Checking...</span>
+    </div>
+    <div class="status-row">
+      <span class="label">SEPolicy</span>
+      <span class="status-badge" id="sepolicyStatus">Checking...</span>
+    </div>
+  </section>
+
+  <section class="card stats-card">
+    <h2>Statistics</h2>
+    <div class="stats-grid">
+      <div class="stat">
+        <span class="stat-value" id="eventsProcessed">0</span>
+        <span class="stat-label">Processed</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="eventsBlocked">0</span>
+        <span class="stat-label">Blocked</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="eventsRedirected">0</span>
+        <span class="stat-label">Redirected</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="errors">0</span>
+        <span class="stat-label">Errors</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card config-card">
+    <h2>Configuration</h2>
+    <div class="config-row">
+      <span class="label">Watchdog Timeout</span>
+      <span class="value" id="watchdogTimeout">3s</span>
+    </div>
+    <div class="config-row">
+      <span class="label">Rules Loaded</span>
+      <span class="value" id="rulesLoaded">0</span>
+    </div>
+    <div class="config-row">
+      <span class="label">Cache Entries</span>
+      <span class="value" id="cacheEntries">0</span>
+    </div>
+  </section>
+
+  <section class="card controls-card">
+    <h2>Controls</h2>
+    <div class="button-group">
+      <button class="btn btn-primary" id="btnReset">Reset</button>
+      <button class="btn btn-danger" id="btnClearLogs">Clear Logs</button>
+      <button class="btn btn-warning" id="btnReloadRules">Reload Rules</button>
+    </div>
+    <div id="actionMessage" class="action-message hidden"></div>
+  </section>
+
+  <footer>
+    <p>Zygisk Virtualizer v1.0.0 &mdash; <a href="https://github.com/anomalyco/opencode" target="_blank">droid-re-chain</a></p>
+  </footer>
+</div>
+<script src="javascript.js"></script>
+</body>
+</html>
