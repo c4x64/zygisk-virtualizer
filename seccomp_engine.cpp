@@ -53,6 +53,8 @@ static void virt_setup_signal_handlers(void) {
 const char *VIRT_DECOY_MAPS_PATH = "/data/local/tmp/clean_maps";
 const char *VIRT_DECOY_STATUS_PATH = "/data/local/tmp/clean_status";
 const char *VIRT_DECOY_MOUNTINFO_PATH = "/data/local/tmp/clean_mountinfo";
+const char *VIRT_DECOY_CMDLINE_PATH = "/data/local/tmp/clean_cmdline";
+const char *VIRT_DECOY_ENVIRON_PATH = "/data/local/tmp/clean_environ";
 
 static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
     "1 0 0:0 / / rw,relatime shared:1 - rootfs rootfs rw",
@@ -63,6 +65,36 @@ static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
     "6 1 0:6 / /data rw,nosuid,nodev,noatime shared:6 - ext4 mmcblk0p44 rw",
     NULL,
 };
+
+static __attribute__((unused)) const char *VIRT_FAKE_CMDLINE_CONTENT[] = {
+    "/system/bin/app_process64",
+    NULL,
+};
+
+static __attribute__((unused)) const char *VIRT_FAKE_ENVIRON_CONTENT[] = {
+    "PATH=/sbin:/system/sbin:/system/bin:/system/xbin",
+    "ANDROID_BOOTLOGO=1",
+    "ANDROID_ROOT=/system",
+    "ANDROID_ASSETS=/system/app",
+    "ANDROID_DATA=/data",
+    "ANDROID_STORAGE=/storage",
+    "EXTERNAL_STORAGE=/sdcard",
+    "ASEC_MOUNTPOINT=/mnt/asec",
+    "BOOTCLASSPATH=/system/framework/core-libart.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/ethernet-service.jar:/system/framework/wifi-service.jar",
+    NULL,
+};
+
+static bool __attribute__((unused)) virt_decoy_file_create_binary(const char *path, const char *const *entries) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+    for (size_t i = 0; entries[i] != NULL; i++) {
+        size_t len = strlen(entries[i]);
+        if (write(fd, entries[i], len) != (ssize_t)len) { close(fd); return false; }
+        if (write(fd, "\0", 1) != 1) { close(fd); return false; }
+    }
+    close(fd);
+    return true;
+}
 
 bool virt_decoy_file_create(const char *path, const char *const *lines) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -92,7 +124,22 @@ static int virt_seccomp_try_addfd(int notify_fd, const struct seccomp_notif *req
     return new_fd;
 }
 
-
+static void __attribute__((unused)) virt_seccomp_fatal_error(const char *msg, int fd) {
+    VIRT_LOGE("FATAL: %s", msg);
+    if (fd >= 0) {
+        struct seccomp_notif req;
+        while (true) {
+            memset(&req, 0, sizeof(req));
+            int rc = ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &req);
+            if (rc < 0) break;
+            struct seccomp_notif_resp resp;
+            memset(&resp, 0, sizeof(resp));
+            resp.id = req.id;
+            resp.error = -ENOSYS;
+            ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+        }
+    }
+}
 
 static sock_filter g_bpf_filter_static[] = {
     {BPF_LD | BPF_W | BPF_ABS, 0, 0, 4},
@@ -412,6 +459,14 @@ int virt_seccomp_create_decoy_files(void) {
     }
     if (virt_decoy_file_create(VIRT_DECOY_MOUNTINFO_PATH, VIRT_FAKE_MOUNTINFO_CONTENT)) {
         VIRT_LOGD("Decoy mountinfo created at %s", VIRT_DECOY_MOUNTINFO_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create_binary(VIRT_DECOY_CMDLINE_PATH, VIRT_FAKE_CMDLINE_CONTENT)) {
+        VIRT_LOGD("Decoy cmdline created at %s", VIRT_DECOY_CMDLINE_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create_binary(VIRT_DECOY_ENVIRON_PATH, VIRT_FAKE_ENVIRON_CONTENT)) {
+        VIRT_LOGD("Decoy environ created at %s", VIRT_DECOY_ENVIRON_PATH);
         ok++;
     }
     return ok;
@@ -1066,6 +1121,28 @@ int virt_seccomp_handler_loop(void *arg) {
                             VIRT_LOGD("[openat] REDIRECT %s -> fd=%d",
                                       path_buf, new_fd);
                     }
+                }
+            }
+        }
+
+        /* --- /proc/self/cmdline and /proc/self/environ openat Spoofing ---
+         * When an app opens /proc/self/cmdline or /proc/self/environ,
+         * redirect to clean decoy files via ADDFD instead of blocking. */
+        if (!should_redirect && !resolved && path_readable && path_len > 0 &&
+            (req.data.nr == __NR_openat || req.data.nr == __NR_openat2)) {
+            const char *decoy = NULL;
+            if (strstr(path_buf, "/cmdline"))
+                decoy = VIRT_DECOY_CMDLINE_PATH;
+            else if (strstr(path_buf, "/environ"))
+                decoy = VIRT_DECOY_ENVIRON_PATH;
+            if (decoy) {
+                int new_fd = virt_seccomp_try_addfd(notify_fd, &req, decoy);
+                if (new_fd >= 0) {
+                    should_redirect = true;
+                    resolved = true;
+                    action = VIRT_ACTION_ALLOW;
+                    if (VIRT_LOG_LEVEL >= VIRT_LOG_LEVEL_DEBUG)
+                        VIRT_LOGD("[openat] SPOOF %s -> %s", path_buf, decoy);
                 }
             }
         }

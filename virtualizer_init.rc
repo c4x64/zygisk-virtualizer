@@ -1,0 +1,12 @@
+# Zygisk Virtualizer - Early Boot Configuration
+# This file is NOT used by Magisk modules directly.
+# It serves as documentation for manual integration.
+
+on early-boot
+    # Create virtualizer directories
+    mkdir /data/local/tmp/virtualizer 0700 shell shell
+    
+on boot
+    # Set permissions
+    chmod 0755 /data/local/tmp/virtualizer
+    chcon u:object_r:shell_data_file:s0 /data/local/tmp/virtualizer

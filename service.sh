@@ -11,6 +11,35 @@ GITHUB_REPO="prabhas/zygisk-virtualizer"
 # Ensure runtime directories exist
 mkdir -p $LOG_DIR
 
+# Late boot initialization phase
+# Mark boot as fully complete (post-fs-data sets this to "0" early in boot)
+echo "1" > $VIRT_DIR/.boot_complete 2>/dev/null || true
+echo "[*] Late boot init complete: $(date)" >> $LOG_DIR/virtualizer.log 2>/dev/null || true
+
+# Store "last good boot" timestamp
+date +%s > $VIRT_DIR/.last_good_boot 2>/dev/null || true
+
+# Crash report generation: if previous boot left a crash artifact, capture dmesg
+if [ -f $VIRT_DIR/.last_boot ]; then
+    if [ -f $VIRT_DIR/.last_good_boot ]; then
+        LAST_BOOT=$(cat $VIRT_DIR/.last_boot 2>/dev/null || echo 0)
+        LAST_GOOD=$(cat $VIRT_DIR/.last_good_boot 2>/dev/null || echo 0)
+        # If last_boot exists and last_good_boot is older (or equal), previous boot crashed
+        if [ "$LAST_BOOT" -ge "$LAST_GOOD" ] 2>/dev/null; then
+            echo "[!] Previous boot may have crashed — saving crash report" >> $LOG_DIR/virtualizer.log
+            dmesg 2>/dev/null | tail -100 > $VIRT_DIR/.crash_report 2>/dev/null || true
+        fi
+    fi
+fi
+
+# Check if Zygisk is loaded by scanning /proc/self/mountinfo for Magisk tmpfs
+ZYGISK_LOADED=0
+if [ -f /proc/self/mountinfo ]; then
+    if grep -q "magisk" /proc/self/mountinfo 2>/dev/null || grep -q "zygisk" /proc/self/mountinfo 2>/dev/null; then
+        ZYGISK_LOADED=1
+    fi
+fi
+
 # Log rotation: keep at most 5 rotated logs, each max ~500KB
 if [ -f $LOG_DIR/virtualizer.log ]; then
     if [ $(stat -c%s $LOG_DIR/virtualizer.log 2>/dev/null || echo 0) -gt 512000 ]; then
@@ -76,6 +105,31 @@ while true; do
     rm -f $MODDIR/zygisk/unloaded
     sleep 30
 done &
+MAIN_LOOP_PID=$!
+
+# Background monitoring loop: every 60 seconds, check if the handler is running
+# and maintain uptime tracking.
+(
+while true; do
+    sleep 60
+
+    # Check if module is disabled
+    if [ -f $MODDIR/disable ]; then
+        continue
+    fi
+
+    # Heuristic check: if Zygisk tmpfs is present but no virtualizer proc is active,
+    # the handler may have crashed. We check by looking for our zygote marker.
+    if [ $ZYGISK_LOADED -eq 1 ]; then
+        if [ ! -f /data/local/tmp/.virt_zygote_marker ]; then
+            echo "[!] Monitoring: handler not running (no zygote marker)" >> $LOG_DIR/virtualizer.log 2>/dev/null || true
+        fi
+    fi
+
+    # Refresh last good boot timestamp
+    date +%s > $VIRT_DIR/.last_good_boot 2>/dev/null || true
+done &
+)
 
 # On KernelSU/APatch with ZygiskNext, verify zygiskd is running
 if [ -n "$KSU" ] || [ -n "$APATCH" ]; then

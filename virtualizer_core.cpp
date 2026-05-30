@@ -3,6 +3,32 @@
 #define VIRT_BLOOM_SIZE 1024
 static uint64_t g_bloom_filter[VIRT_BLOOM_SIZE / 64] = {0};
 
+#define VIRT_ERR_COUNT_MAX 32
+static uint32_t g_error_counts[VIRT_ERR_COUNT_MAX] = {0};
+
+#define VIRT_INC_ERR(code) do { \
+    int _idx = -(code); \
+    if (_idx >= 0 && _idx < VIRT_ERR_COUNT_MAX) \
+        __sync_fetch_and_add(&g_error_counts[_idx], 1); \
+} while (0)
+
+void virt_print_error_summary(void) {
+    VIRT_LOGI("Error summary: %u OOM, %u INVAL, %u TIMEOUT, %u NODEV, "
+              "%u CORRUPT, %u IO, %u BUSY, %u CONFIG, %u BPF, %u SECCOMP",
+              g_error_counts[-VIRT_ERR_NOMEM],
+              g_error_counts[-VIRT_ERR_INVAL],
+              g_error_counts[-VIRT_ERR_TIMEOUT],
+              g_error_counts[-VIRT_ERR_NODEV],
+              g_error_counts[-VIRT_ERR_CORRUPT],
+              g_error_counts[-VIRT_ERR_IO],
+              g_error_counts[-VIRT_ERR_BUSY],
+              g_error_counts[-VIRT_ERR_CONFIG],
+              g_error_counts[-VIRT_ERR_BPF],
+              g_error_counts[-VIRT_ERR_SECCOMP]);
+}
+
+
+
 static uint32_t virt_bloom_hash1(const char *str, uint32_t len) {
     uint32_t hash = 5381;
     for (uint32_t i = 0; i < len; i++)
@@ -83,13 +109,13 @@ static void trie_node_free_recursive(TrieNode *node) {
 }
 
 int virt_trie_insert(const char *path, int action, uint32_t priority) {
-    if (!path || !path[0]) return VIRT_ERR_INVAL;
+    if (!path || !path[0]) { VIRT_INC_ERR(VIRT_ERR_INVAL); return VIRT_ERR_INVAL; }
 
     pthread_mutex_lock(&g_trie_lock);
 
     if (!g_trie_root) {
         g_trie_root = trie_node_alloc('\0');
-        if (!g_trie_root) { pthread_mutex_unlock(&g_trie_lock); return VIRT_ERR_NOMEM; }
+        if (!g_trie_root) { pthread_mutex_unlock(&g_trie_lock); VIRT_INC_ERR(VIRT_ERR_NOMEM); return VIRT_ERR_NOMEM; }
     }
 
     TrieNode *node = g_trie_root;
@@ -99,7 +125,7 @@ int virt_trie_insert(const char *path, int action, uint32_t priority) {
         unsigned char c = (unsigned char)path[i];
         if (!node->children[c]) {
             node->children[c] = trie_node_alloc((char)c);
-            if (!node->children[c]) { pthread_mutex_unlock(&g_trie_lock); return VIRT_ERR_NOMEM; }
+            if (!node->children[c]) { pthread_mutex_unlock(&g_trie_lock); VIRT_INC_ERR(VIRT_ERR_NOMEM); return VIRT_ERR_NOMEM; }
             if (node != g_trie_root && node->fallback) {
                 TrieNode *fb = node->fallback;
                 while (fb && !fb->children[c]) fb = fb->fallback;
@@ -1404,11 +1430,11 @@ int virt_rules_load_json(const char *filepath, VIRT_Rule *rules,
     if (!filepath || !rules || !rule_count) return VIRT_ERR_INVAL;
 
     FILE *f = fopen(filepath, "r");
-    if (!f) return -1;
+    if (!f) return VIRT_ERR_NOENT;
 
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
-    if (fsize <= 0) { fclose(f); return -1; }
+    if (fsize <= 0) { fclose(f); return VIRT_ERR_NOENT; }
     fseek(f, 0, SEEK_SET);
 
     char *data = (char *)malloc((size_t)fsize + 1);
@@ -1416,7 +1442,7 @@ int virt_rules_load_json(const char *filepath, VIRT_Rule *rules,
 
     size_t nread = fread(data, 1, (size_t)fsize, f);
     fclose(f);
-    if ((long)nread != fsize) { free(data); return -1; }
+    if ((long)nread != fsize) { free(data); return VIRT_ERR_IO; }
     data[nread] = '\0';
 
     const char *p = data;
@@ -1796,6 +1822,133 @@ int virt_init_default_connect_rules(void) {
     }
     VIRT_LOGI("Default connect rules: %d loaded", count);
     return count;
+}
+
+int virt_mask_cmdline(const char *input, uint32_t input_len,
+                      char *output, uint32_t output_size) {
+    if (!input || !output || input_len == 0 || output_size == 0)
+        return -1;
+
+    static const char *sensitive_keywords[] = {
+        "magisk", "modules", "zygisk", "tweak", "mod", "virtual",
+        "debug", "test", "patch", "hook", "inject", NULL
+    };
+
+    uint32_t out_pos = 0;
+    uint32_t in_pos = 0;
+
+    while (in_pos < input_len && out_pos < output_size - 1) {
+        const char *segment = input + in_pos;
+        uint32_t seg_len = 0;
+        while (in_pos + seg_len < input_len && input[in_pos + seg_len] != '\0')
+            seg_len++;
+
+        if (seg_len > 0) {
+            bool is_sensitive = false;
+            for (int i = 0; sensitive_keywords[i]; i++) {
+                const char *kw = sensitive_keywords[i];
+                for (uint32_t j = 0; j < seg_len; j++) {
+                    if (segment[j] == kw[0]) {
+                        size_t klen = strlen(kw);
+                        if (j + klen <= seg_len &&
+                            memcmp(segment + j, kw, klen) == 0) {
+                            is_sensitive = true;
+                            break;
+                        }
+                    }
+                }
+                if (is_sensitive) break;
+            }
+
+            if (is_sensitive) {
+                const char *replacement = "app_process64";
+                uint32_t repl_len = (uint32_t)strlen(replacement);
+                uint32_t copy_len = VIRT_MIN(repl_len, output_size - out_pos - 1);
+                memcpy(output + out_pos, replacement, copy_len);
+                out_pos += copy_len;
+            } else {
+                uint32_t copy_len = VIRT_MIN(seg_len, output_size - out_pos - 1);
+                memcpy(output + out_pos, segment, copy_len);
+                out_pos += copy_len;
+            }
+        }
+
+        if (out_pos < output_size - 1) {
+            output[out_pos++] = '\0';
+        }
+        in_pos += seg_len + 1;
+    }
+
+    output[VIRT_MIN(out_pos, output_size - 1)] = '\0';
+    return (int)out_pos;
+}
+
+int virt_mask_environ(char *buffer, uint32_t buffer_size) {
+    if (!buffer || buffer_size == 0) return -1;
+
+    static const char *sensitive_prefixes[] = {
+        "LD_PRELOAD=", "LD_LIBRARY_PATH=", "MAGISK=", "MAGISKTMP=",
+        "KSU=", "KSUSD=", "ZYGISK=", "APATCH=",
+        "DEXOADY=", "RIRU=", "SULIST=", NULL
+    };
+    static const char *sensitive_containing[] = {
+        "magisk", "ksu", "zygisk", "xposed", "frida",
+        "substrate", "riru", "edxposed", "lsposed", NULL
+    };
+
+    uint32_t read_pos = 0;
+    uint32_t write_pos = 0;
+
+    while (read_pos < buffer_size) {
+        const char *entry = buffer + read_pos;
+        uint32_t entry_len = 0;
+        while (read_pos + entry_len < buffer_size && buffer[read_pos + entry_len] != '\0')
+            entry_len++;
+
+        if (entry_len == 0) {
+            read_pos++;
+            continue;
+        }
+
+        bool sensitive = false;
+
+        for (int i = 0; sensitive_prefixes[i]; i++) {
+            size_t plen = strlen(sensitive_prefixes[i]);
+            if (entry_len >= plen && memcmp(entry, sensitive_prefixes[i], plen) == 0) {
+                sensitive = true;
+                break;
+            }
+        }
+
+        if (!sensitive) {
+            for (int i = 0; sensitive_containing[i]; i++) {
+                const char *kw = sensitive_containing[i];
+                size_t klen = strlen(kw);
+                for (uint32_t j = 0; j + klen <= entry_len; j++) {
+                    if (memcmp(entry + j, kw, klen) == 0) {
+                        sensitive = true;
+                        break;
+                    }
+                }
+                if (sensitive) break;
+            }
+        }
+
+        if (!sensitive) {
+            if (write_pos + entry_len + 1 <= buffer_size) {
+                memcpy(buffer + write_pos, entry, entry_len);
+                write_pos += entry_len;
+                buffer[write_pos++] = '\0';
+            }
+        }
+
+        read_pos += entry_len + 1;
+    }
+
+    if (write_pos < buffer_size)
+        buffer[write_pos] = '\0';
+
+    return (int)write_pos;
 }
 
 int virt_spoof_uname(struct utsname *uts) {

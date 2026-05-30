@@ -134,6 +134,7 @@
 #define VIRT_PATH_BUF_SIZE      4096
 #define VIRT_TMP_BUF_SIZE       8192
 #define VIRT_PROC_NAME_MAX      256
+#define VIRT_MAX_ENVIRON_ENTRIES 64
 #define VIRT_MAX_RULES          1024
 #define VIRT_MAX_CACHED_PATHS   8192
 #define VIRT_MAX_STATS_HISTORY  3600
@@ -762,27 +763,53 @@ enum VIRT_HANDLER_STATE : int {
     VIRT_HANDLER_STATE_COUNT    = 6
 };
 
-enum VIRT_ERROR : int {
-    VIRT_OK             = 0,
-    VIRT_ERR_GENERIC    = -1,
-    VIRT_ERR_NOMEM      = -2,
-    VIRT_ERR_INVAL      = -3,
-    VIRT_ERR_NODEV      = -4,
-    VIRT_ERR_NOSYS      = -5,
-    VIRT_ERR_AGAIN      = -6,
-    VIRT_ERR_BUSY       = -7,
-    VIRT_ERR_PERM       = -8,
-    VIRT_ERR_NOTSUP     = -9,
-    VIRT_ERR_NOENT      = -10,
-    VIRT_ERR_EXIST      = -11,
-    VIRT_ERR_INTR       = -12,
-    VIRT_ERR_TIMEOUT    = -13,
-    VIRT_ERR_OVERFLOW   = -14,
-    VIRT_ERR_CORRUPT    = -15,
-    VIRT_ERR_LIMIT      = -16,
-    VIRT_ERR_DEADLK     = -17,
-    VIRT_ERR_AGAIN_RETRY = -18,
-};
+#define VIRT_OK             0
+#define VIRT_ERR_NOMEM      -1   // Out of memory
+#define VIRT_ERR_INVAL      -2   // Invalid argument
+#define VIRT_ERR_NODEV      -3   // No device (seccomp not available)
+#define VIRT_ERR_AGAIN      -4   // Try again
+#define VIRT_ERR_TIMEOUT    -5   // Operation timed out
+#define VIRT_ERR_CANCELED   -6   // Operation canceled
+#define VIRT_ERR_NOTSUP     -7   // Not supported
+#define VIRT_ERR_BPF        -8   // BPF compilation error
+#define VIRT_ERR_SECCOMP    -9   // Seccomp syscall error
+#define VIRT_ERR_HANDLER    -10  // Handler thread error
+#define VIRT_ERR_CONFIG     -11  // Configuration error
+#define VIRT_ERR_IO         -12  // I/O error
+#define VIRT_ERR_CORRUPT    -13  // Corrupted data
+#define VIRT_ERR_BUSY       -14  // Resource busy
+#define VIRT_ERR_EXIST      -15  // Already exists
+// Backward-compatibility aliases
+#define VIRT_ERR_GENERIC    -99
+#define VIRT_ERR_NOSYS      -98
+#define VIRT_ERR_PERM       -97
+#define VIRT_ERR_NOENT      -96
+#define VIRT_ERR_INTR       -95
+#define VIRT_ERR_OVERFLOW   -94
+#define VIRT_ERR_LIMIT      -93
+#define VIRT_ERR_DEADLK     -92
+#define VIRT_ERR_AGAIN_RETRY -91
+
+static inline const char *virt_strerror(int err) {
+    switch (err) {
+        case VIRT_ERR_NOMEM:    return "Out of memory";
+        case VIRT_ERR_INVAL:    return "Invalid argument";
+        case VIRT_ERR_NODEV:    return "Seccomp not available";
+        case VIRT_ERR_AGAIN:    return "Try again";
+        case VIRT_ERR_TIMEOUT:  return "Operation timed out";
+        case VIRT_ERR_CANCELED: return "Operation canceled";
+        case VIRT_ERR_NOTSUP:   return "Not supported";
+        case VIRT_ERR_BPF:      return "BPF compilation error";
+        case VIRT_ERR_SECCOMP:  return "Seccomp syscall error";
+        case VIRT_ERR_HANDLER:  return "Handler thread error";
+        case VIRT_ERR_CONFIG:   return "Configuration error";
+        case VIRT_ERR_IO:       return "I/O error";
+        case VIRT_ERR_CORRUPT:  return "Corrupted data";
+        case VIRT_ERR_BUSY:     return "Resource busy";
+        case VIRT_ERR_EXIST:    return "Already exists";
+        default:                return "Unknown error";
+    }
+}
 
 enum VIRT_PROCESS_PROFILE : int {
     VIRT_PROFILE_UNKNOWN        = 0,
@@ -1390,7 +1417,6 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "/proc/self/mountinfo",
     "/proc/self/mounts",
     "/proc/self/exe",
-    "/proc/self/cmdline",
     NULL,
 };
 
@@ -1535,7 +1561,7 @@ static int __attribute__((unused)) virterror_from_errno(void) {
         case EINTR:  return VIRT_ERR_INTR;
         case ETIMEDOUT: return VIRT_ERR_TIMEOUT;
         case EOVERFLOW: return VIRT_ERR_OVERFLOW;
-        case ECANCELED: return VIRT_ERR_CORRUPT;
+        case ECANCELED: return VIRT_ERR_CANCELED;
         case EMFILE:  return VIRT_ERR_LIMIT;
         case ENFILE:  return VIRT_ERR_LIMIT;
         case EDEADLK: return VIRT_ERR_DEADLK;
@@ -1763,6 +1789,8 @@ int virt_seccomp_create_decoy_files(void);
 bool virt_decoy_file_create(const char *path, const char *const *lines);
 extern const char *VIRT_DECOY_MAPS_PATH;
 extern const char *VIRT_DECOY_STATUS_PATH;
+extern const char *VIRT_DECOY_CMDLINE_PATH;
+extern const char *VIRT_DECOY_ENVIRON_PATH;
 int virt_seccomp_read_path(struct seccomp_notif *req,
                              char *buf, size_t buf_size,
                              uint64_t path_addr);
@@ -1820,5 +1848,9 @@ int virt_is_safe_mode(void);
 void virt_log_event(const char *event_type, const char *path, int action);
 int virt_stats_dump_to_file(const char *filepath, const VIRT_SyscallStats *stats);
 int virt_reload_rules(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules);
+
+int virt_mask_cmdline(const char *input, uint32_t input_len,
+                      char *output, uint32_t output_size);
+int virt_mask_environ(char *buffer, uint32_t buffer_size);
 
 #endif /* VIRTUALIZER_H */

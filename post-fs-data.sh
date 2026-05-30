@@ -4,9 +4,26 @@
 MODDIR=/data/adb/modules/zygisk-virtualizer
 VIRT_DIR=/data/local/tmp/virtualizer
 
+# Clean mode: if called with --clean, remove runtime artifacts and exit
+if [ "$1" = "--clean" ]; then
+    rm -rf $VIRT_DIR
+    rm -f /data/local/tmp/.virt_zygote_marker
+    echo "[*] Cleanup complete: $(date)" >> /dev/null
+    exit 0
+fi
+
 # Create runtime directories
 mkdir -p $VIRT_DIR
 mkdir -p $VIRT_DIR/logs
+
+# KernelSU kernel module loading: if a .ko exists alongside the module, load it
+if [ -f $MODDIR/virtualizer.ko ]; then
+    if [ -x /system/bin/modprobe ]; then
+        /system/bin/modprobe -d $MODDIR virtualizer 2>/dev/null || true
+    elif [ -x /system/bin/insmod ]; then
+        /system/bin/insmod $MODDIR/virtualizer.ko 2>/dev/null || true
+    fi
+fi
 
 # Health check on boot: verify module files exist
 if [ ! -f $MODDIR/module.prop ]; then
@@ -33,8 +50,11 @@ if [ -f /data/adb/ksu/.disable_ksu ]; then
     exit 1
 fi
 
-# Initial boot marker: record this boot timestamp
+# Record boot timestamp for uptime tracking
 date +%s > $VIRT_DIR/.last_boot 2>/dev/null || true
+
+# Create boot-complete marker (post-fs-data runs early; service.sh marks full completion)
+echo "0" > $VIRT_DIR/.boot_complete 2>/dev/null || true
 
 # Remove stale Zygisk unloaded flag from previous boot
 rm -f $MODDIR/zygisk/unloaded
