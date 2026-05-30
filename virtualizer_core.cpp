@@ -1815,6 +1815,59 @@ int virt_decoy_init(VIRT_Config *cfg) {
     return VIRT_OK;
 }
 
+int virt_scan_for_frida(void) {
+    char line[512];
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+
+    const char *frida_signatures[] = {
+        "frida", "frida-agent", "frida-helper", "frida-gadget",
+        "gum-", "gumjs", "_frida_", "libfrida", NULL
+    };
+
+    while (fgets(line, sizeof(line), fp)) {
+        for (int i = 0; frida_signatures[i]; i++) {
+            if (strstr(line, frida_signatures[i])) {
+                fclose(fp);
+                VIRT_LOGW("Frida detected: %s", line);
+                return 1;
+            }
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+int virt_scan_for_xposed(void) {
+    char line[512];
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+
+    const char *xposed_signatures[] = {
+        "xposed", "edxp", "lsposed", "riru", "substrate", NULL
+    };
+
+    while (fgets(line, sizeof(line), fp)) {
+        for (int i = 0; xposed_signatures[i]; i++) {
+            if (strstr(line, xposed_signatures[i])) {
+                fclose(fp);
+                VIRT_LOGW("Xposed detected: %s", line);
+                return 1;
+            }
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+void virt_hide_from_frida(void) {
+    VIRT_LOGD("Frida hide: periodic scan check");
+}
+
+void virt_hide_from_xposed(void) {
+    VIRT_LOGD("Xposed hide: periodic scan check");
+}
+
 int virt_anti_tamper_loop(void *arg) {
     (void)arg;
     prctl(PR_SET_NAME, "anti-tamper", 0, 0, 0);
@@ -1837,19 +1890,14 @@ int virt_anti_tamper_loop(void *arg) {
         virt_anti_tamper_check_memory(&state);
         virt_anti_tamper_check_code(&state);
 
-        int fd = open("/proc/self/maps", O_RDONLY);
-        if (fd >= 0) {
-            char buf[4096];
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            close(fd);
-            if (n > 0) {
-                buf[n] = '\0';
-                if (strstr(buf, "frida") || strstr(buf, "xposed") ||
-                    strstr(buf, "gadget") || strstr(buf, "substrate")) {
-                    VIRT_LOGW("Anti-tamper: detection tool found in maps!");
-                }
-            }
+        if (virt_scan_for_frida()) {
+            VIRT_LOGW("Anti-tamper: Frida detected in process!");
         }
+        if (virt_scan_for_xposed()) {
+            VIRT_LOGW("Anti-tamper: Xposed detected in process!");
+        }
+        virt_hide_from_frida();
+        virt_hide_from_xposed();
 
         state.total_checks++;
         state.last_check_ns = virt_gettime_ns();
@@ -2057,6 +2105,47 @@ int virt_spoof_uname(struct utsname *uts) {
     return VIRT_OK;
 }
 
+uint64_t g_uptime_base_override = 0;
+
+void virt_set_uptime_base(uint64_t seconds) {
+    g_uptime_base_override = seconds;
+}
+
+int virt_get_fake_uptime(char *buf, size_t buf_size) {
+    uint64_t base = g_uptime_base_override;
+    if (base == 0) base = VIRT_UPTIME_BASE_SECONDS;
+    base += 12345;
+    int n = snprintf(buf, buf_size, "%llu.%02llu %llu.%02llu",
+                     (unsigned long long)base, 0ULL,
+                     (unsigned long long)(base * 2), 0ULL);
+    if (n < 0) return -1;
+    return VIRT_MIN(n, (int)buf_size - 1);
+}
+
+int virt_get_fake_stat(char *buf, size_t buf_size) {
+    const char *fake_stat =
+        "cpu  1234567 23456 789012 987654321 12345 6789 1234 5678 0 0\n"
+        "cpu0 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu1 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu2 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu3 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu4 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu5 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu6 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "cpu7 123456 2345 78901 98765432 1234 678 123 567 0 0\n"
+        "intr 12345678 ...\n"
+        "ctxt 987654321\n"
+        "btime 1234567890\n"
+        "processes 12345\n"
+        "procs_running 2\n"
+        "procs_blocked 0\n";
+    size_t len = strlen(fake_stat);
+    size_t copy_len = VIRT_MIN(len, buf_size - 1);
+    memcpy(buf, fake_stat, copy_len);
+    buf[copy_len] = '\0';
+    return (int)copy_len;
+}
+
 int virt_run_self_test(void) {
     int passed = 0;
     int failed = 0;
@@ -2139,4 +2228,26 @@ int virt_run_self_test(void) {
 
     VIRT_LOGI("Self-test: %d passed, %d failed", passed, failed);
     return failed;
+}
+
+int virt_get_fake_selinux_context(char *buf, size_t buf_size) {
+    int n = snprintf(buf, buf_size, "%s\n", VIRT_FAKE_SELINUX_CONTEXT);
+    if (n < 0) return -1;
+    return VIRT_MIN(n, (int)buf_size - 1);
+}
+
+int virt_spoof_selinux_context(pid_t target_pid) {
+    (void)target_pid;
+    return VIRT_OK;
+}
+
+int virt_is_selinux_enforcing(void) {
+    char buf[16];
+    int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    return (buf[0] == '1') ? 1 : 0;
 }

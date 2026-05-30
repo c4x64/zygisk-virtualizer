@@ -7,4 +7,4 @@ zygisk-virtualizer/
 .idea/
 .DS_Store
 AGENTS.md
-.github/workflows/
+

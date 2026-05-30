@@ -13,6 +13,8 @@
 #define VIRT_ENV_APATCH    3
 #define VIRT_ENV_UNKNOWN   0
 
+#define VIRT_FAKE_SELINUX_CONTEXT "u:r:untrusted_app:s0:c512,c768"
+
 #define VIRT_SUPPORTED_ENVS \
     "Magisk 27.0+, KernelSU (with ZygiskNext), APatch (with ZygiskNext)"
 
@@ -154,6 +156,7 @@
 #define VIRT_MAX_LISTENERS      256
 #define VIRT_MAX_DEPENDENCY_CHAIN 16
 #define VIRT_SIGNAL_STACK_SIZE  (32 * 1024)
+#define VIRT_UPTIME_BASE_SECONDS 86400ULL
 
 #ifndef AUDIT_ARCH_AARCH64
 #define AUDIT_ARCH_AARCH64 (EM_AARCH64 | 0x40000000)
@@ -1433,6 +1436,39 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "/proc/self/mountinfo",
     "/proc/self/mounts",
     "/proc/self/exe",
+    "/data/local/tmp/frida",
+    "/data/local/tmp/re.frida",
+    "/data/local/tmp/frida-server",
+    "/data/local/frida",
+    "/data/local/tmp/lief",
+    "/data/local/tmp/libtrace",
+    "/data/local/tmp/linjector",
+    "/data/local/tmp/hijack",
+    "/data/local/tmp/inject",
+    "/data/local/tmp/injector",
+    "/data/local/tmp/dobby",
+    "/data/local/tmp/bhook",
+    "/data/local/tmp/ree",
+    "/data/local/tmp/libree",
+    "/data/local/tmp/xposed",
+    "/data/local/tmp/edxposed",
+    "/data/local/tmp/lsposed",
+    "/data/local/tmp/zygisk",
+    "/data/local/tmp/riru",
+    "/data/local/tmp/substrate",
+    "/data/local/tmp/cyanogenmod",
+    "/data/local/tmp/strace",
+    "/data/local/tmp/gdb",
+    "/data/local/tmp/gdbserver",
+    "/data/local/tmp/.frida",
+    "/data/local/tmp/__frida",
+    "/system/lib/libfrida",
+    "/system/lib64/libfrida",
+    "/system/lib/libxposed",
+    "/system/lib64/libxposed",
+    "/proc/uptime",
+    "/proc/stat",
+    "/proc/self/attr/current",
     NULL,
 };
 
@@ -1807,6 +1843,9 @@ extern const char *VIRT_DECOY_MAPS_PATH;
 extern const char *VIRT_DECOY_STATUS_PATH;
 extern const char *VIRT_DECOY_CMDLINE_PATH;
 extern const char *VIRT_DECOY_ENVIRON_PATH;
+extern const char *VIRT_DECOY_UPTIME_PATH;
+extern const char *VIRT_DECOY_STAT_PATH;
+extern const char *VIRT_DECOY_SELINUX_PATH;
 int virt_seccomp_read_path(struct seccomp_notif *req,
                              char *buf, size_t buf_size,
                              uint64_t path_addr);
@@ -1860,6 +1899,10 @@ int virt_check_environment_support(void);
 
 int virt_anti_tamper_loop(void *arg);
 int virt_spoof_uname(struct utsname *uts);
+void virt_set_uptime_base(uint64_t seconds);
+int virt_get_fake_uptime(char *buf, size_t buf_size);
+int virt_get_fake_stat(char *buf, size_t buf_size);
+int virt_get_fake_selinux_context(char *buf, size_t buf_size);
 int virt_is_safe_mode(void);
 void virt_log_event(const char *event_type, const char *path, int action);
 int virt_stats_dump_to_file(const char *filepath, const VIRT_SyscallStats *stats);
@@ -1868,5 +1911,8 @@ int virt_reload_rules(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules
 int virt_mask_cmdline(const char *input, uint32_t input_len,
                       char *output, uint32_t output_size);
 int virt_mask_environ(char *buffer, uint32_t buffer_size);
+
+int virt_spoof_selinux_context(pid_t target_pid);
+int virt_is_selinux_enforcing(void);
 
 #endif /* VIRTUALIZER_H */

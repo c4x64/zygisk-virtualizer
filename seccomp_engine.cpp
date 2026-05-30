@@ -62,6 +62,9 @@ const char *VIRT_DECOY_STATUS_PATH = "/data/local/tmp/clean_status";
 const char *VIRT_DECOY_MOUNTINFO_PATH = "/data/local/tmp/clean_mountinfo";
 const char *VIRT_DECOY_CMDLINE_PATH = "/data/local/tmp/clean_cmdline";
 const char *VIRT_DECOY_ENVIRON_PATH = "/data/local/tmp/clean_environ";
+const char *VIRT_DECOY_UPTIME_PATH = "/data/local/tmp/clean_uptime";
+const char *VIRT_DECOY_STAT_PATH = "/data/local/tmp/clean_stat";
+const char *VIRT_DECOY_SELINUX_PATH = "/data/local/tmp/clean_selinux";
 
 static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
     "1 0 0:0 / / rw,relatime shared:1 - rootfs rootfs rw",
@@ -75,6 +78,35 @@ static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
 
 static __attribute__((unused)) const char *VIRT_FAKE_CMDLINE_CONTENT[] = {
     "/system/bin/app_process64",
+    NULL,
+};
+
+static const char *VIRT_FAKE_UPTIME_CONTENT[] = {
+    "98765.43 197530.86",
+    NULL,
+};
+
+static const char *VIRT_FAKE_STAT_CONTENT[] = {
+    "cpu  1234567 23456 789012 987654321 12345 6789 1234 5678 0 0",
+    "cpu0 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu1 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu2 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu3 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu4 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu5 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu6 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "cpu7 123456 2345 78901 98765432 1234 678 123 567 0 0",
+    "intr 12345678 ...",
+    "ctxt 987654321",
+    "btime 1234567890",
+    "processes 12345",
+    "procs_running 2",
+    "procs_blocked 0",
+    NULL,
+};
+
+static const char *VIRT_FAKE_SELINUX_CONTENT[] = {
+    "u:r:untrusted_app:s0:c512,c768",
     NULL,
 };
 
@@ -474,6 +506,18 @@ int virt_seccomp_create_decoy_files(void) {
     }
     if (virt_decoy_file_create_binary(VIRT_DECOY_ENVIRON_PATH, VIRT_FAKE_ENVIRON_CONTENT)) {
         VIRT_LOGD("Decoy environ created at %s", VIRT_DECOY_ENVIRON_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_UPTIME_PATH, VIRT_FAKE_UPTIME_CONTENT)) {
+        VIRT_LOGD("Decoy uptime created at %s", VIRT_DECOY_UPTIME_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_STAT_PATH, VIRT_FAKE_STAT_CONTENT)) {
+        VIRT_LOGD("Decoy stat created at %s", VIRT_DECOY_STAT_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_SELINUX_PATH, VIRT_FAKE_SELINUX_CONTENT)) {
+        VIRT_LOGD("Decoy selinux context created at %s", VIRT_DECOY_SELINUX_PATH);
         ok++;
     }
     return ok;
@@ -1130,12 +1174,20 @@ int virt_seccomp_handler_loop(void *arg) {
             if (req.data.nr == __NR_openat || req.data.nr == __NR_openat2) {
                 if (strstr(path_buf, "maps"))
                     redirect_path = VIRT_DECOY_MAPS_PATH;
-                else if (strstr(path_buf, "status") ||
-                         strstr(path_buf, "stat"))
+                else if (strstr(path_buf, "uptime"))
+                    redirect_path = VIRT_DECOY_UPTIME_PATH;
+                else if (strstr(path_buf, "/proc/stat"))
+                    redirect_path = VIRT_DECOY_STAT_PATH;
+                else if (strstr(path_buf, "/proc/self/attr/current"))
+                    redirect_path = VIRT_DECOY_SELINUX_PATH;
+                else if (strstr(path_buf, "status"))
                     redirect_path = VIRT_DECOY_STATUS_PATH;
                 else if (strstr(path_buf, "mountinfo") ||
                          strstr(path_buf, "mounts"))
                     redirect_path = VIRT_DECOY_MOUNTINFO_PATH;
+                else if (strstr(path_buf, "attr/current") ||
+                         strstr(path_buf, "attr/"))
+                    redirect_path = VIRT_DECOY_SELINUX_PATH;
                 if (redirect_path) {
                     int new_fd = virt_seccomp_try_addfd(notify_fd, &req,
                                                          redirect_path);
