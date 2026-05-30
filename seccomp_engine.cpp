@@ -1,5 +1,8 @@
 #include "virtualizer.h"
 
+extern int virt_decoy_load_from_file(const char *filepath, char *out_buf, size_t buf_size);
+extern int virt_decoy_init(VIRT_Config *cfg);
+
 static uint64_t g_seccomp_engine_events = 0;
 static uint64_t g_seccomp_engine_errors = 0;
 static uint64_t g_seccomp_engine_continue_fallback = 0;
@@ -167,7 +170,7 @@ static int bpf_compiler_compile(BPFCompiler *c, VIRT_SeccompFilterProfile *profi
 
     if (match_count == 0) {
         int ret_all = bpf_compiler_ret(c, SECCOMP_RET_ALLOW);
-        return ret_all >= 0 ? 0 : -1;
+        return ret_all >= 0 ? c->current : -1;
     }
 
     int remaining = match_count;
@@ -198,22 +201,13 @@ static void __attribute__((unused)) bpf_compiler_dump(BPFCompiler *c) {
     VIRT_LOGI("BPF Compiler: %d instructions generated", c->current);
     for (int i = 0; i < c->current; i++) {
         sock_filter *f = &c->instructions[i];
-        uint16_t op = f->code & 0xE0;
+        int cls = f->code & 0x07;
         const char *op_name = "UNK";
-        if (op == BPF_LD) op_name = "LD";
-        else if (op == BPF_JMP) op_name = "JMP";
-        else if (op == BPF_RET) op_name = "RET";
-        uint16_t mode = f->code & 0x18;
-        const char *mode_name = "";
-        if (op == BPF_LD) {
-            if (mode == BPF_W) mode_name = ".W";
-            mode_name = ".ABS";
-        } else if (op == BPF_JMP) {
-            if ((f->code & 0x07) == BPF_JEQ) mode_name = ".JEQ";
-            mode_name = ".K";
-        }
-        VIRT_LOGT("  [%2d] %s%s jt=%u jf=%u k=%u (0x%x)",
-                  i, op_name, mode_name, f->jt, f->jf, f->k, f->k);
+        if (cls == 0x00) op_name = "LD";
+        else if (cls == 0x05) op_name = "JMP";
+        else if (cls == 0x06) op_name = "RET";
+        VIRT_LOGT("  [%2d] %s jt=%u jf=%u k=%u (0x%x)",
+                  i, op_name, f->jt, f->jf, f->k, f->k);
     }
 }
 
@@ -315,9 +309,9 @@ int virt_seccomp_install_static(VIRT_Config *cfg,
     int filter_flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
     if (cfg->enable_thread_sync && g_seccomp_engine_has_tsync) {
         filter_flags |= SECCOMP_FILTER_FLAG_TSYNC;
-    }
-    if (g_seccomp_engine_features & 32) {
-        filter_flags |= SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+        if (g_seccomp_engine_features & 32) {
+            filter_flags |= SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+        }
     }
 
     int notify_fd = (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
@@ -619,10 +613,8 @@ int virt_seccomp_handler_loop(void *arg) {
 
     struct seccomp_notif req;
     struct seccomp_notif_resp resp;
-    VIRT_SyscallStats stats;
     VIRT_Watchdog watchdog;
     VIRT_HealthStatus health;
-    VIRT_ProcHiderState proc_hider;
     VIRT_TimingJitter jitter;
     uint64_t event_ring[256];
     uint32_t event_ring_pos = 0;
@@ -637,21 +629,32 @@ int virt_seccomp_handler_loop(void *arg) {
         VIRT_MAX_RULES, sizeof(VIRT_Rule));
     uint32_t rule_count = 0;
 
-    if (!cache || !rules) {
-        VIRT_LOGE("Handler: OOM allocating cache/rules");
+    VIRT_SyscallStats *stats = (VIRT_SyscallStats *)calloc(1, sizeof(VIRT_SyscallStats));
+    VIRT_ProcHiderState *proc_hider = (VIRT_ProcHiderState *)calloc(1, sizeof(VIRT_ProcHiderState));
+
+    if (!cache || !rules || !stats || !proc_hider) {
+        VIRT_LOGE("Handler: OOM allocating cache/rules/stats/proc_hider");
         free(cache);
         free(rules);
+        free(stats);
+        free(proc_hider);
         close(notify_fd);
         return VIRT_ERR_NOMEM;
     }
 
-    memset(&stats, 0, sizeof(stats));
     memset(&health, 0, sizeof(health));
     memset(&req, 0, sizeof(req));
     memset(&resp, 0, sizeof(resp));
     memset(&jitter, 0, sizeof(jitter));
 
-    stats.last_reset_tp = virt_gettime_ns();
+    VIRT_Config decoy_cfg = VIRT_DEFAULT_CONFIG;
+    if (virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &decoy_cfg) == VIRT_OK) {
+        VIRT_LOGI("Handler: config loaded from %s", VIRT_DEFAULT_CONFIG.config_path);
+    }
+    decoy_cfg.enable_file_decoy = true;
+    virt_decoy_init(&decoy_cfg);
+
+    stats->last_reset_tp = virt_gettime_ns();
     health.handler_state = VIRT_HANDLER_RUNNING;
     health.notify_fd = notify_fd;
     health.thread_alive = true;
@@ -674,15 +677,30 @@ int virt_seccomp_handler_loop(void *arg) {
     virt_watchdog_arm(&watchdog);
     watchdog_ok = true;
 
-    virt_stats_init(&stats);
+    virt_stats_init(stats);
     stats_ok = true;
 
     virt_rules_load_defaults(rules, &rule_count, VIRT_MAX_RULES);
+
+    {
+        int json_count = virt_rules_load_json(
+            VIRT_DEFAULT_CONFIG.rules_json_path,
+            rules, &rule_count, VIRT_MAX_RULES);
+        if (json_count > 0) {
+            VIRT_LOGI("Loaded %d JSON rules from %s",
+                      json_count, VIRT_DEFAULT_CONFIG.rules_json_path);
+            virt_rules_sort(rules, rule_count);
+        } else if (json_count < 0) {
+            VIRT_LOGD("No JSON rules loaded from %s (err=%d)",
+                      VIRT_DEFAULT_CONFIG.rules_json_path, json_count);
+        }
+    }
+
     health.active_rules = rule_count;
 
-    virt_proc_hider_init(&proc_hider);
-    virt_proc_hider_add_fd(&proc_hider, notify_fd);
-    g_seccomp_engine_proc_hider = &proc_hider;
+    virt_proc_hider_init(proc_hider);
+    virt_proc_hider_add_fd(proc_hider, notify_fd);
+    g_seccomp_engine_proc_hider = proc_hider;
 
     jitter.enabled = false;
     jitter.base_us = 0;
@@ -828,7 +846,7 @@ int virt_seccomp_handler_loop(void *arg) {
 
         /* Dynamic /proc/self/fd/<hidden_fd> check */
         if (path_readable && path_len > 0 && !resolved) {
-            if (virt_proc_hider_check_fd_path(&proc_hider,
+            if (virt_proc_hider_check_fd_path(proc_hider,
                                                path_buf, (uint32_t)path_len)) {
                 action = VIRT_ACTION_BLOCK_ENOENT;
                 resolved = true;
@@ -981,7 +999,7 @@ int virt_seccomp_handler_loop(void *arg) {
         g_seccomp_engine_total_latency_ns += total_time;
 
         if (stats_ok) {
-            virt_stats_record(&stats, req.data.nr, action, total_time);
+            virt_stats_record(stats, req.data.nr, action, total_time);
         }
 
         if (watchdog_ok && g_seccomp_engine_has_continue) {
@@ -989,7 +1007,7 @@ int virt_seccomp_handler_loop(void *arg) {
         }
 
         clock_gettime(CLOCK_MONOTONIC, &health.last_heartbeat);
-        health.uptime_ns = virt_gettime_ns() - stats.last_reset_tp;
+        health.uptime_ns = virt_gettime_ns() - stats->last_reset_tp;
 
         if (VIRT_LOG_LEVEL >= VIRT_LOG_LEVEL_TRACE &&
             health.processed_events % 100 == 0) {
@@ -1005,7 +1023,7 @@ int virt_seccomp_handler_loop(void *arg) {
 
         if (health.processed_events % 5000 == 0) {
             char stats_buf[2048];
-            virt_stats_snapshot(&stats, stats_buf, sizeof(stats_buf));
+            virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
             VIRT_LOGI("Periodic stats:\n%s", stats_buf);
         }
     }
@@ -1037,6 +1055,8 @@ int virt_seccomp_handler_loop(void *arg) {
 
     free(cache);
     free(rules);
+    free(stats);
+    free(proc_hider);
     return 0;
 }
 

@@ -668,8 +668,9 @@ int virt_rules_sort(VIRT_Rule *rules, uint32_t rule_count) {
 int virt_rules_load_defaults(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules) {
     if (!rules || !rule_count) return VIRT_ERR_INVAL;
     *rule_count = 0;
+    VIRT_Rule rule;
     for (size_t i = 0; VIRT_DEFAULT_BLOCKED_PATTERNS[i] != NULL && *rule_count < max_rules; i++) {
-        VIRT_Rule rule; memset(&rule, 0, sizeof(rule));
+        memset(&rule, 0, sizeof(rule));
         virt_safe_strncpy(rule.pattern, VIRT_DEFAULT_BLOCKED_PATTERNS[i], sizeof(rule.pattern));
         rule.pattern_len = (uint32_t)strlen(VIRT_DEFAULT_BLOCKED_PATTERNS[i]);
         rule.match_type = VIRT_MATCH_SUBSTRING; rule.action = VIRT_ACTION_BLOCK_ENOENT;
@@ -938,6 +939,14 @@ int virt_config_load(const char *path, VIRT_Config *cfg) {
         else if (!strcmp(key, "enable_event_ring")) set_bool(&cfg->enable_event_ring);
         else if (!strcmp(key, "enable_latency_tracking")) set_bool(&cfg->enable_latency_tracking);
         else if (!strcmp(key, "enable_periodic_reporting")) set_bool(&cfg->enable_periodic_reporting);
+        else if (!strcmp(key, "enable_jitter")) set_bool(&cfg->enable_timing_jitter);
+        else if (!strcmp(key, "jitter_base_us")) set_u32(&cfg->timing_jitter_us);
+        else if (!strcmp(key, "jitter_range_us")) set_u32(&cfg->jitter_range_us);
+        else if (!strcmp(key, "enable_proc_hider")) set_bool(&cfg->enable_proc_hiding);
+        else if (!strcmp(key, "enable_file_decoy")) set_bool(&cfg->enable_file_decoy);
+        else if (!strcmp(key, "fake_maps_path")) virt_safe_strncpy(cfg->fake_maps_path, val, sizeof(cfg->fake_maps_path));
+        else if (!strcmp(key, "fake_status_path")) virt_safe_strncpy(cfg->fake_status_path, val, sizeof(cfg->fake_status_path));
+        else if (!strcmp(key, "rules_json_path")) virt_safe_strncpy(cfg->rules_path, val, sizeof(cfg->rules_path));
         else if (!strcmp(key, "config_path")) virt_safe_strncpy(cfg->config_path, val, sizeof(cfg->config_path));
         else if (!strcmp(key, "rules_path")) virt_safe_strncpy(cfg->rules_path, val, sizeof(cfg->rules_path));
         else if (!strcmp(key, "log_tag")) virt_safe_strncpy(cfg->log_tag, val, sizeof(cfg->log_tag));
@@ -1188,4 +1197,335 @@ int virt_init_shadow_library(const char *lib_name) {
 
 const ShadowLibraryMirror *virt_get_shadow_mirror(void) {
     return &g_shadow_library;
+}
+
+static char g_decoy_maps_buf[VIRT_PATH_BUF_SIZE * 8];
+static char g_decoy_status_buf[VIRT_PATH_BUF_SIZE * 4];
+static bool g_decoy_maps_loaded = false;
+static bool g_decoy_status_loaded = false;
+
+int virt_decoy_load_from_file(const char *filepath, char *out_buf, size_t buf_size) {
+    if (!filepath || !out_buf || buf_size == 0) return VIRT_ERR_INVAL;
+    int fd = open(filepath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        VIRT_LOGW("Decoy file open failed: %s (%s)", filepath, strerror(errno));
+        return VIRT_ERR_NOENT;
+    }
+    ssize_t n = read(fd, out_buf, buf_size - 1);
+    if (n < 0) {
+        VIRT_LOGE("Decoy file read failed: %s (%s)", filepath, strerror(errno));
+        close(fd);
+        return VIRT_ERR_GENERIC;
+    }
+    close(fd);
+    out_buf[n] = '\0';
+    while (n > 0 && (out_buf[n - 1] == '\n' || out_buf[n - 1] == '\r'))
+        out_buf[--n] = '\0';
+    VIRT_LOGI("Decoy loaded: %s (%zd bytes)", filepath, n);
+    return (int)n;
+}
+
+static int json_skip_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r')
+        (*p)++;
+    return 0;
+}
+
+static int json_match(const char **p, char c) {
+    json_skip_ws(p);
+    if (**p == c) { (*p)++; return 0; }
+    return -1;
+}
+
+static int json_parse_string(const char **p, char *out, size_t out_size) {
+    json_skip_ws(p);
+    if (**p != '"') return -1;
+    (*p)++;
+    size_t i = 0;
+    while (**p && **p != '"' && i + 1 < out_size) {
+        if (**p == '\\' && *(p[0] + 1)) {
+            (*p)++;
+            switch (**p) {
+                case '"': out[i++] = '"'; break;
+                case '\\': out[i++] = '\\'; break;
+                case '/': out[i++] = '/'; break;
+                case 'n': out[i++] = '\n'; break;
+                case 'r': out[i++] = '\r'; break;
+                case 't': out[i++] = '\t'; break;
+                default: out[i++] = **p; break;
+            }
+        } else {
+            out[i++] = **p;
+        }
+        (*p)++;
+    }
+    if (**p != '"') return -1;
+    out[i] = '\0';
+    (*p)++;
+    return (int)i;
+}
+
+static int json_parse_int(const char **p, int *out) {
+    json_skip_ws(p);
+    int sign = 1;
+    if (**p == '-') { sign = -1; (*p)++; }
+    if (!isdigit((unsigned char)**p)) return -1;
+    int val = 0;
+    while (isdigit((unsigned char)**p)) {
+        val = val * 10 + (**p - '0');
+        (*p)++;
+    }
+    *out = val * sign;
+    return 0;
+}
+
+static int json_match_type_from_string(const char *s) {
+    if (strcmp(s, "exact") == 0)    return VIRT_MATCH_EXACT;
+    if (strcmp(s, "prefix") == 0)   return VIRT_MATCH_PREFIX;
+    if (strcmp(s, "suffix") == 0)   return VIRT_MATCH_SUFFIX;
+    if (strcmp(s, "substr") == 0)   return VIRT_MATCH_SUBSTRING;
+    if (strcmp(s, "glob") == 0)     return VIRT_MATCH_GLOB;
+    return -1;
+}
+
+static int json_action_from_string(const char *s) {
+    if (strcmp(s, "allow") == 0)        return VIRT_ACTION_ALLOW;
+    if (strcmp(s, "block_enoent") == 0 || strcmp(s, "block-enoent") == 0)
+        return VIRT_ACTION_BLOCK_ENOENT;
+    if (strcmp(s, "block_eacces") == 0 || strcmp(s, "block-eacces") == 0)
+        return VIRT_ACTION_BLOCK_EACCES;
+    if (strcmp(s, "block_eperm") == 0 || strcmp(s, "block-eperm") == 0)
+        return VIRT_ACTION_BLOCK_EPERM;
+    if (strcmp(s, "block_enxio") == 0 || strcmp(s, "block-enxio") == 0)
+        return VIRT_ACTION_BLOCK_ENXIO;
+    if (strcmp(s, "block_eio") == 0 || strcmp(s, "block-eio") == 0)
+        return VIRT_ACTION_BLOCK_EIO;
+    if (strcmp(s, "block_erofs") == 0 || strcmp(s, "block-erofs") == 0)
+        return VIRT_ACTION_BLOCK_EROFS;
+    if (strcmp(s, "redirect") == 0)     return VIRT_ACTION_REDIRECT_PATH;
+    if (strcmp(s, "fake_content") == 0 || strcmp(s, "fake-content") == 0)
+        return VIRT_ACTION_FAKE_CONTENT;
+    if (strcmp(s, "fake_empty") == 0 || strcmp(s, "fake-empty") == 0)
+        return VIRT_ACTION_FAKE_EMPTY;
+    if (strcmp(s, "fake_maps") == 0 || strcmp(s, "fake-maps") == 0)
+        return VIRT_ACTION_FAKE_MAPS;
+    if (strcmp(s, "fake_status") == 0 || strcmp(s, "fake-status") == 0)
+        return VIRT_ACTION_FAKE_STATUS;
+    if (strcmp(s, "pass_through") == 0 || strcmp(s, "pass-through") == 0)
+        return VIRT_ACTION_PASS_THROUGH;
+    if (strcmp(s, "kill") == 0)         return VIRT_ACTION_BLOCK_EPERM;
+    return -1;
+}
+
+static int json_category_from_string(const char *s) {
+    if (strcmp(s, "proc") == 0)    return VIRT_CAT_PROC;
+    if (strcmp(s, "debug") == 0)   return VIRT_CAT_DEBUG;
+    if (strcmp(s, "root") == 0)    return VIRT_CAT_DEBUG;
+    if (strcmp(s, "hook") == 0)    return VIRT_CAT_DEBUG;
+    if (strcmp(s, "system") == 0)  return VIRT_CAT_FILE_READ;
+    if (strcmp(s, "tmp") == 0)     return VIRT_CAT_FILE_WRITE;
+    if (strcmp(s, "sys") == 0)     return VIRT_CAT_FILE_META;
+    if (strcmp(s, "app") == 0)     return VIRT_CAT_OTHER;
+    if (strcmp(s, "other") == 0)   return VIRT_CAT_OTHER;
+    return VIRT_CAT_OTHER;
+}
+
+int virt_rules_load_json(const char *filepath, VIRT_Rule *rules,
+                         uint32_t *rule_count, uint32_t max_rules) {
+    if (!filepath || !rules || !rule_count) return VIRT_ERR_INVAL;
+
+    FILE *f = fopen(filepath, "r");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0) { fclose(f); return -1; }
+    fseek(f, 0, SEEK_SET);
+
+    char *data = (char *)malloc((size_t)fsize + 1);
+    if (!data) { fclose(f); return VIRT_ERR_NOMEM; }
+
+    size_t nread = fread(data, 1, (size_t)fsize, f);
+    fclose(f);
+    if ((long)nread != fsize) { free(data); return -1; }
+    data[nread] = '\0';
+
+    const char *p = data;
+    int loaded = 0;
+
+    json_skip_ws(&p);
+    if (*p != '[') { free(data); return -1; }
+    p++;
+
+    while (*p && *p != ']') {
+        json_skip_ws(&p);
+        if (*p == ']') break;
+        if (*p != '{') { p++; continue; }
+        p++;
+
+        char key[256];
+        char pattern[VIRT_PATH_BUF_SIZE] = {0};
+        char match_type_str[64] = {0};
+        char action_str[64] = {0};
+        char redirect_target[VIRT_PATH_BUF_SIZE] = {0};
+        char fake_content_path[VIRT_PATH_BUF_SIZE] = {0};
+        char category_str[64] = {0};
+        int priority = 0;
+        bool has_priority = false;
+        bool valid = true;
+
+        while (*p && *p != '}' && valid) {
+            json_skip_ws(&p);
+            if (*p == '}') break;
+
+            if (json_parse_string(&p, key, sizeof(key)) < 0) {
+                valid = false; break;
+            }
+            if (json_match(&p, ':') < 0) { valid = false; break; }
+
+            if (strcmp(key, "pattern") == 0) {
+                if (json_parse_string(&p, pattern, sizeof(pattern)) < 0)
+                    valid = false;
+            } else if (strcmp(key, "match_type") == 0) {
+                if (json_parse_string(&p, match_type_str, sizeof(match_type_str)) < 0)
+                    valid = false;
+            } else if (strcmp(key, "action") == 0) {
+                if (json_parse_string(&p, action_str, sizeof(action_str)) < 0)
+                    valid = false;
+            } else if (strcmp(key, "redirect_target") == 0) {
+                if (json_parse_string(&p, redirect_target, sizeof(redirect_target)) < 0)
+                    valid = false;
+            } else if (strcmp(key, "fake_content_path") == 0) {
+                if (json_parse_string(&p, fake_content_path, sizeof(fake_content_path)) < 0)
+                    valid = false;
+            } else if (strcmp(key, "category") == 0) {
+                if (json_parse_string(&p, category_str, sizeof(category_str)) < 0)
+                    valid = false;
+            } else if (strcmp(key, "priority") == 0) {
+                if (json_parse_int(&p, &priority) == 0)
+                    has_priority = true;
+                else
+                    valid = false;
+            } else {
+                json_skip_ws(&p);
+                if (*p == '"') {
+                    char skip[256];
+                    json_parse_string(&p, skip, sizeof(skip));
+                } else if (*p == '-' || isdigit((unsigned char)*p)) {
+                    int dummy;
+                    json_parse_int(&p, &dummy);
+                }
+            }
+
+            json_skip_ws(&p);
+            if (*p == ',') p++;
+        }
+
+        if (*p == '}') p++;
+
+        if (!valid || pattern[0] == '\0' || action_str[0] == '\0') {
+            json_skip_ws(&p);
+            if (*p == ',') p++;
+            continue;
+        }
+
+        int match_type = match_type_str[0]
+            ? json_match_type_from_string(match_type_str)
+            : VIRT_MATCH_EXACT;
+        int action = json_action_from_string(action_str);
+        if (match_type < 0 || action < 0) {
+            json_skip_ws(&p);
+            if (*p == ',') p++;
+            continue;
+        }
+
+        if (*rule_count >= max_rules) { free(data); return loaded; }
+
+        VIRT_Rule *r = &rules[*rule_count];
+        memset(r, 0, sizeof(VIRT_Rule));
+        virt_safe_strncpy(r->pattern, pattern, sizeof(r->pattern));
+        r->pattern_len = (uint32_t)strlen(pattern);
+        r->match_type = match_type;
+        r->action = action;
+        r->scope = VIRT_SCOPE_ALL;
+        r->category = category_str[0]
+            ? json_category_from_string(category_str)
+            : VIRT_CAT_OTHER;
+        r->priority = has_priority ? (uint32_t)priority : 0;
+        if (redirect_target[0])
+            virt_safe_strncpy(r->redirect_target, redirect_target,
+                              sizeof(r->redirect_target));
+        if (fake_content_path[0])
+            virt_safe_strncpy(r->fake_content_path, fake_content_path,
+                              sizeof(r->fake_content_path));
+        r->enabled = true;
+        r->is_default = false;
+        r->is_system = false;
+        r->created_ns = virt_gettime_ns();
+        r->ref_count = 1;
+        (*rule_count)++;
+        loaded++;
+
+        json_skip_ws(&p);
+        if (*p == ',') p++;
+    }
+
+    free(data);
+    return loaded;
+}
+
+int virt_detect_environment(void) {
+    if (access("/data/adb/magisk", F_OK) == 0) return VIRT_ENV_MAGISK;
+    if (access("/data/adb/ksu", F_OK) == 0) return VIRT_ENV_KERNELSU;
+    if (access("/data/adb/ap", F_OK) == 0) return VIRT_ENV_APATCH;
+    return VIRT_ENV_UNKNOWN;
+}
+
+int virt_check_environment_support(void) {
+    int env = virt_detect_environment();
+    switch (env) {
+        case VIRT_ENV_MAGISK:
+            /* Magisk has native Zygisk — fully supported */
+            return 1;
+        case VIRT_ENV_KERNELSU:
+        case VIRT_ENV_APATCH:
+            /* KernelSU/APatch need ZygiskNext for Zygisk support */
+            if (access("/data/adb/modules/zygisk_next", F_OK) == 0)
+                return 1;
+            if (access("/data/adb/modules/zygisk-ng", F_OK) == 0)
+                return 1;
+            if (access("/data/adb/modules/zygisksu", F_OK) == 0)
+                return 1;
+            /* ZygiskNext not detected — still return 1 since we hook
+             * via onLoad which is only called when Zygisk is present */
+            VIRT_LOGW("KernelSU/APatch detected but no ZygiskNext found");
+            return 1;
+        default:
+            VIRT_LOGW("Unknown root environment");
+            return 0;
+    }
+}
+
+int virt_decoy_init(VIRT_Config *cfg) {
+    if (!cfg) return VIRT_ERR_INVAL;
+    if (!cfg->enable_file_decoy) {
+        VIRT_LOGI("File decoy: disabled");
+        return VIRT_OK;
+    }
+    if (cfg->fake_maps_path[0]) {
+        int ret = virt_decoy_load_from_file(cfg->fake_maps_path,
+                                            g_decoy_maps_buf,
+                                            sizeof(g_decoy_maps_buf));
+        if (ret >= 0) g_decoy_maps_loaded = true;
+    }
+    if (cfg->fake_status_path[0]) {
+        int ret = virt_decoy_load_from_file(cfg->fake_status_path,
+                                            g_decoy_status_buf,
+                                            sizeof(g_decoy_status_buf));
+        if (ret >= 0) g_decoy_status_loaded = true;
+    }
+    VIRT_LOGI("File decoy: maps=%s status=%s",
+              g_decoy_maps_loaded ? "loaded" : "unavailable",
+              g_decoy_status_loaded ? "loaded" : "unavailable");
+    return VIRT_OK;
 }

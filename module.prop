@@ -1,6 +1,7 @@
 id=zygisk-virtualizer
-name=Universal Syscall Virtualization Framework
+name=Zygisk Virtualizer
 version=v1.0.0
-versionCode=1
+versionCode=100
 author=droid-re-chain
-description=Global system call cloaking sandbox using SECCOMP_RET_USER_NOTIF to virtualize sensitive environment paths across all applications. Intercepts openat/readlinkat/faccessat natively and autonomously blocks root/magisk/anti-cheat path detection without ptrace overhead.
+description=SECCOMP-based path virtualization module that hides root/magisk/frida/xposed traces from detection. Supports Magisk 27+, KernelSU, APatch, and ZygiskNext.
+minMagisk=27000

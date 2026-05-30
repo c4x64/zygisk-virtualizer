@@ -219,11 +219,18 @@ public:
         int features = 0;
         virt_seccomp_get_features(&features);
 
+        int rt_env = virt_detect_environment();
+        VIRT_ZYGISK_LOGI("Runtime environment: %s",
+            rt_env == VIRT_ENV_MAGISK ? "Magisk" :
+            rt_env == VIRT_ENV_KERNELSU ? "KernelSU" :
+            rt_env == VIRT_ENV_APATCH ? "APatch" : "Unknown");
+
         VIRT_ZYGISK_LOGI(
-            "Virtualizer v%s loaded (load_count=%u, kernel_features=0x%x)",
+            "Virtualizer v%s loaded (load_count=%u, kernel_features=0x%x, env=%s)",
             VIRTUALIZER_VERSION,
             g_virt_module_load_count,
-            features
+            features,
+            VIRT_SUPPORTED_ENVS
         );
 
         if (!(features & 1)) {

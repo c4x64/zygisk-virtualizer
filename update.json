@@ -1,0 +1,6 @@
+{
+    "version": "v1.0.0",
+    "versionCode": 100,
+    "zipUrl": "https://github.com/c4x64/zygisk-virtualizer/releases/latest/download/zygisk-virtualizer-v1.0.0.zip",
+    "changelog": "https://raw.githubusercontent.com/c4x64/zygisk-virtualizer/main/CHANGELOG.md"
+}

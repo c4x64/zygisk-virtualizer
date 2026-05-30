@@ -6,6 +6,14 @@
 #define VIRTUALIZER_VERSION_PATCH 0
 #define VIRTUALIZER_VERSION "1.0.0"
 
+#define VIRT_ENV_MAGISK    1
+#define VIRT_ENV_KERNELSU  2
+#define VIRT_ENV_APATCH    3
+#define VIRT_ENV_UNKNOWN   0
+
+#define VIRT_SUPPORTED_ENVS \
+    "Magisk 27.0+, KernelSU (with ZygiskNext), APatch (with ZygiskNext)"
+
 #include <android/log.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -840,6 +848,10 @@ typedef struct VIRT_Rule {
 typedef struct VIRT_Config {
     char config_path[VIRT_PATH_BUF_SIZE];
     char rules_path[VIRT_PATH_BUF_SIZE];
+    char rules_json_path[VIRT_PATH_BUF_SIZE];
+    char fake_maps_path[VIRT_PATH_BUF_SIZE];
+    char fake_status_path[VIRT_PATH_BUF_SIZE];
+    bool enable_file_decoy;
     char log_tag[64];
     int  log_level;
     int  filter_mode;
@@ -867,6 +879,7 @@ typedef struct VIRT_Config {
     uint32_t handler_stack_size;
     uint32_t notif_timeout_ms;
     uint32_t timing_jitter_us;
+    uint32_t jitter_range_us;
     uint32_t reconnect_delay_ms;
     uint32_t max_consecutive_errors;
     uint32_t max_event_ring_entries;
@@ -1232,8 +1245,12 @@ static const char *VIRT_PROFILE_NAMES[VIRT_PROFILE_COUNT] = {
 };
 
 static const VIRT_Config VIRT_DEFAULT_CONFIG = {
-    .config_path              = "",
+    .config_path              = "/data/local/tmp/virtualizer/config.txt",
     .rules_path               = "",
+    .rules_json_path          = "/data/local/tmp/virtualizer/rules.json",
+    .fake_maps_path           = "/data/local/tmp/virtualizer/maps",
+    .fake_status_path         = "/data/local/tmp/virtualizer/status",
+    .enable_file_decoy        = false,
     .log_tag                  = "Virtualizer",
     .log_level                = VIRT_LOG_LEVEL_INFO,
     .filter_mode              = VIRT_FILTER_MODE_BPF_STATIC,
@@ -1261,6 +1278,7 @@ static const VIRT_Config VIRT_DEFAULT_CONFIG = {
     .handler_stack_size       = VIRT_HANDLER_STACK_SIZE,
     .notif_timeout_ms         = VIRT_NOTIF_FD_TIMEOUT_MS,
     .timing_jitter_us         = 0,
+    .jitter_range_us          = 0,
     .reconnect_delay_ms       = 1000,
     .max_consecutive_errors   = 10,
     .max_event_ring_entries   = VIRT_EVENT_RING_SIZE,
@@ -1347,29 +1365,69 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
 };
 
 static const char *VIRT_FAKE_MAPS_CONTENT[] = {
-    "12c00000-12c01000 r-xp 00001000 fe:00 12345     /system/bin/app_process64",
-    "12c01000-12c02000 r--p 00002000 fe:00 12345     /system/bin/app_process64",
-    "12c02000-12c03000 rw-p 00003000 fe:00 12345     /system/bin/app_process64",
-    "70000000-70001000 r-xp 00000000 fe:00 67890     /system/lib64/libc.so",
-    "70001000-70002000 r--p 00001000 fe:00 67890     /system/lib64/libc.so",
-    "70002000-70003000 rw-p 00002000 fe:00 67890     /system/lib64/libc.so",
-    "70003000-70004000 rw-p 00000000 00:00 0         [anon:libc_malloc]",
-    "7a000000-7a001000 r-xp 00000000 fe:00 11111     /system/lib64/libm.so",
-    "7a001000-7a002000 r--p 00001000 fe:00 11111     /system/lib64/libm.so",
-    "7a002000-7a003000 rw-p 00002000 fe:00 11111     /system/lib64/libm.so",
-    "7b000000-7b001000 r-xp 00000000 fe:00 22222     /system/lib64/libdl.so",
-    "7b001000-7b002000 r--p 00001000 fe:00 22222     /system/lib64/libdl.so",
-    "7b002000-7b003000 rw-p 00002000 fe:00 22222     /system/lib64/libdl.so",
-    "7c000000-7c001000 r-xp 00000000 fe:00 33333     /system/lib64/libc++.so",
-    "7c001000-7c002000 r--p 00001000 fe:00 33333     /system/lib64/libc++.so",
-    "7c002000-7c003000 rw-p 00002000 fe:00 33333     /system/lib64/libc++.so",
-    "7d000000-7d001000 r-xp 00000000 fe:00 44444     /system/lib64/liblog.so",
-    "7d001000-7d002000 r--p 00001000 fe:00 44444     /system/lib64/liblog.so",
-    "7d002000-7d003000 rw-p 00002000 fe:00 44444     /system/lib64/liblog.so",
-    "7ffff000-80000000 rw-p 00000000 00:00 0         [stack]",
-    "80000000-80001000 r-xp 00000000 fe:00 55555     /system/framework/arm64/boot.oat",
-    "80001000-80002000 r--p 00001000 fe:00 55555     /system/framework/arm64/boot.oat",
-    "80002000-80003000 rw-p 00002000 fe:00 55555     /system/framework/arm64/boot.oat",
+    "557e8000-558e9000 r-xp 00000000 fe:00 12345     /system/bin/app_process64",
+    "558e9000-558ea000 r--p 00101000 fe:00 12345     /system/bin/app_process64",
+    "558ea000-558ec000 rw-p 00102000 fe:00 12345     /system/bin/app_process64",
+    "558ec000-558f0000 rw-p 00000000 00:00 0         [anon:.bss]",
+    "7c000000-7c032000 r-xp 00000000 fe:00 67890     /system/lib64/linker64",
+    "7c032000-7c034000 r--p 00031000 fe:00 67890     /system/lib64/linker64",
+    "7c034000-7c038000 rw-p 00033000 fe:00 67890     /system/lib64/linker64",
+    "7c038000-7c03d000 rw-p 00000000 00:00 0         [anon:linker_alloc]",
+    "7c03d000-7c0a7000 r-xp 00000000 fe:00 67891     /system/lib64/libc.so",
+    "7c0a7000-7c0ab000 r--p 00069000 fe:00 67891     /system/lib64/libc.so",
+    "7c0ab000-7c0ac000 rw-p 0006d000 fe:00 67891     /system/lib64/libc.so",
+    "7c0ac000-7c0b1000 rw-p 00000000 00:00 0         [anon:libc_malloc]",
+    "7c0b1000-7c0d3000 r-xp 00000000 fe:00 67892     /system/lib64/libm.so",
+    "7c0d3000-7c0d4000 r--p 00021000 fe:00 67892     /system/lib64/libm.so",
+    "7c0d4000-7c0d5000 rw-p 00022000 fe:00 67892     /system/lib64/libm.so",
+    "7c0d5000-7c0d7000 r-xp 00000000 fe:00 67893     /system/lib64/libdl.so",
+    "7c0d7000-7c0d8000 r--p 00001000 fe:00 67893     /system/lib64/libdl.so",
+    "7c0d8000-7c0d9000 rw-p 00002000 fe:00 67893     /system/lib64/libdl.so",
+    "7c0d9000-7c153000 r-xp 00000000 fe:00 67894     /system/lib64/libandroid_runtime.so",
+    "7c153000-7c159000 r--p 00079000 fe:00 67894     /system/lib64/libandroid_runtime.so",
+    "7c159000-7c15e000 rw-p 0007f000 fe:00 67894     /system/lib64/libandroid_runtime.so",
+    "7c15e000-7c192000 r-xp 00000000 fe:00 67895     /system/lib64/libc++.so",
+    "7c192000-7c196000 r--p 00033000 fe:00 67895     /system/lib64/libc++.so",
+    "7c196000-7c197000 rw-p 00037000 fe:00 67895     /system/lib64/libc++.so",
+    "7c197000-7c202000 r-xp 00000000 fe:00 67896     /system/lib64/liblog.so",
+    "7c202000-7c204000 r--p 0006a000 fe:00 67896     /system/lib64/liblog.so",
+    "7c204000-7c205000 rw-p 0006c000 fe:00 67896     /system/lib64/liblog.so",
+    "7c205000-7c23d000 r-xp 00000000 fe:00 67897     /system/lib64/libnativehelper.so",
+    "7c23d000-7c240000 r--p 00037000 fe:00 67897     /system/lib64/libnativehelper.so",
+    "7c240000-7c241000 rw-p 0003a000 fe:00 67897     /system/lib64/libnativehelper.so",
+    "7c241000-7c251000 r-xp 00000000 fe:00 67898     /system/lib64/libz.so",
+    "7c251000-7c252000 r--p 0000f000 fe:00 67898     /system/lib64/libz.so",
+    "7c252000-7c253000 rw-p 00010000 fe:00 67898     /system/lib64/libz.so",
+    "7c253000-7c28b000 r-xp 00000000 fe:00 67899     /system/lib64/libexpat.so",
+    "7c28b000-7c28d000 r--p 00037000 fe:00 67899     /system/lib64/libexpat.so",
+    "7c28d000-7c28e000 rw-p 00039000 fe:00 67899     /system/lib64/libexpat.so",
+    "7c28e000-7c2b7000 r-xp 00000000 fe:00 67900     /system/lib64/libwilhelm.so",
+    "7c2b7000-7c2b9000 r--p 00028000 fe:00 67900     /system/lib64/libwilhelm.so",
+    "7c2b9000-7c2ba000 rw-p 0002a000 fe:00 67900     /system/lib64/libwilhelm.so",
+    "7c2ba000-7c415000 r-xp 00000000 fe:00 67901     /system/lib64/libicuuc.so",
+    "7c415000-7c426000 r--p 0015a000 fe:00 67901     /system/lib64/libicuuc.so",
+    "7c426000-7c429000 rw-p 0016b000 fe:00 67901     /system/lib64/libicuuc.so",
+    "7c429000-7c438000 r-xp 00000000 fe:00 67902     /system/lib64/libnativebridge.so",
+    "7c438000-7c43a000 r--p 0000e000 fe:00 67902     /system/lib64/libnativebridge.so",
+    "7c43a000-7c43b000 rw-p 00010000 fe:00 67902     /system/lib64/libnativebridge.so",
+    "7c43b000-7d243000 r-xp 00000000 fe:00 67903     /system/framework/arm64/boot.oat",
+    "7d243000-7d2ed000 r--p 00e07000 fe:00 67903     /system/framework/arm64/boot.oat",
+    "7d2ed000-7d2f1000 rw-p 00eb1000 fe:00 67903     /system/framework/arm64/boot.oat",
+    "7d2f1000-7d3f1000 rw-p 00000000 00:00 0         [anon:dalvik-alloc-space]",
+    "7d3f1000-7d471000 rw-p 00000000 00:00 0         [anon:dalvik-main-space]",
+    "7d471000-7d4f1000 rw-p 00000000 00:00 0         [anon:dalvik-non-moving-space]",
+    "7d4f1000-7d4f2000 ---p 00000000 00:00 0         [anon:signal_page]",
+    "7d4f2000-7d531000 rw-p 00000000 00:00 0         [anon:thread_db]",
+    "7d531000-7d534000 r-xp 00000000 00:00 0         [vdso]",
+    "7d534000-7d53e000 rw-p 00000000 00:00 0         [stack:1002]",
+    "7d53e000-7d542000 rw-p 00000000 00:00 0         [stack:1003]",
+    "7d542000-7d546000 rw-p 00000000 00:00 0         [stack:1004]",
+    "7de00000-7de04000 rw-p 00000000 00:00 0         [anon:scudo:primary]",
+    "7de04000-7de31000 rw-p 00000000 00:00 0         [anon:scudo:secondary]",
+    "7de31000-7df00000 rw-p 00000000 00:00 0         [anon:scudo:metadata]",
+    "7e000000-7f000000 rw-p 00000000 00:00 0         [anon:dalvik-jit-code-cache]",
+    "7ffbe000-7ffe0000 rw-p 00000000 00:00 0         [stack]",
+    "7ffe0000-7ffe1000 r-xp 00000000 00:00 0         [vdso]",
     NULL,
 };
 
@@ -1377,51 +1435,58 @@ static const char *VIRT_FAKE_STATUS_CONTENT[] = {
     "Name:   app_process64",
     "State:  S (sleeping)",
     "Tgid:   12345",
+    "Ngid:   0",
     "Pid:    12345",
     "PPid:   1",
     "TracerPid:      0",
     "Uid:   10123   10123   10123   10123",
     "Gid:   10123   10123   10123   10123",
-    "FDSize:        64",
+    "FDSize:        128",
     "Groups:        3001 9997 20123",
-    "VmPeak:        1234567 kB",
-    "VmSize:        1234567 kB",
+    "NStgid: 12345",
+    "NSpid:  12345",
+    "NSpgid: 12345",
+    "NSsid:  12345",
+    "VmPeak:        2345678 kB",
+    "VmSize:        2345678 kB",
     "VmLck:         0 kB",
     "VmPin:         0 kB",
-    "VmHWM:         234567 kB",
-    "VmRSS:         234567 kB",
-    "RssAnon:       200000 kB",
-    "RssFile:        34567 kB",
+    "VmHWM:         345678 kB",
+    "VmRSS:         345678 kB",
+    "RssAnon:       310000 kB",
+    "RssFile:        35678 kB",
     "RssShmem:       0 kB",
-    "VmData:        456789 kB",
+    "VmData:        567890 kB",
     "VmStk:         132 kB",
     "VmExe:         12 kB",
-    "VmLib:         67890 kB",
-    "VmPTE:         567 kB",
+    "VmLib:         78901 kB",
+    "VmPTE:         789 kB",
     "VmSwap:        0 kB",
+    "HugetlbPages:  0 kB",
     "CoreDumping:   0",
     "THP_enabled:   1",
-    "Threads:       12",
-    "SigQ:   0/12345",
+    "Threads:       18",
+    "SigQ:   0/24680",
     "SigPnd: 0000000000000000",
     "ShdPnd: 0000000000000000",
-    "SigBlk: 0000000000000000",
-    "SigIgn: 0000000000001000",
-    "SigCgt: 0000000000000000",
+    "SigBlk: 0000000000001204",
+    "SigIgn: 0000000000001006",
+    "SigCgt: 00000001800044e7",
     "CapInh: 0000000000000000",
     "CapPrm: 0000000000000000",
     "CapEff: 0000000000000000",
     "CapBnd: 0000000000000000",
     "CapAmb: 0000000000000000",
-    "Seccomp:        2",
-    "Seccomp_filters:        1",
+    "NoNewPrivs:     1",
+    "Seccomp:        0",
     "Speculation_Store_Bypass:       thread vulnerable",
+    "SpeculationIndirectBranch:      always enabled",
     "Cpus_allowed:   ff",
     "Cpus_allowed_list:      0-7",
     "Mems_allowed:   1",
     "Mems_allowed_list:      0",
-    "voluntary_ctxt_switches:        12345",
-    "nonvoluntary_ctxt_switches:     6789",
+    "voluntary_ctxt_switches:        18456",
+    "nonvoluntary_ctxt_switches:     3241",
     NULL,
 };
 
@@ -1642,6 +1707,8 @@ int virt_rules_lookup(const VIRT_Rule *rules, uint32_t rule_count,
 int virt_rules_sort(VIRT_Rule *rules, uint32_t rule_count);
 int virt_rules_load_defaults(VIRT_Rule *rules, uint32_t *rule_count,
                              uint32_t max_rules);
+int virt_rules_load_json(const char *filepath, VIRT_Rule *rules,
+                         uint32_t *rule_count, uint32_t max_rules);
 int virt_rules_count_by_action(const VIRT_Rule *rules, uint32_t rule_count,
                                int action);
 int virt_rules_count_by_category(const VIRT_Rule *rules, uint32_t rule_count,
@@ -1705,5 +1772,8 @@ const ShadowLibraryMirror *virt_get_shadow_mirror(void);
 int virt_safe_strncpy(char *dst, const char *src, size_t dst_size);
 int virt_safe_strcat(char *dst, const char *src, size_t dst_size);
 void virt_print_hexdump(const void *data, size_t len, const char *label);
+
+int virt_detect_environment(void);
+int virt_check_environment_support(void);
 
 #endif /* VIRTUALIZER_H */
