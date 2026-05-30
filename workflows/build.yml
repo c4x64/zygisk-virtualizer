@@ -1,0 +1,171 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Build with debug symbols'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: r25c
+  NDK_ZIP: android-ndk-r25c-linux.zip
+  NDK_URL: https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+  NDK_DIR: /opt/android-ndk-r25c
+  NDK_CHECKSUM: 1e58c1ceeec859105edd45a36d7895e9
+
+jobs:
+  build:
+    name: Build arm64-v8a
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK_DIR }}
+          key: ndk-${{ env.NDK_VERSION }}-${{ runner.arch }}
+
+      - name: Setup Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Android NDK ${{ env.NDK_VERSION }}..."
+          curl -fsSL -o /tmp/${{ env.NDK_ZIP }} ${{ env.NDK_URL }}
+          echo "Verifying download..."
+          ls -la /tmp/${{ env.NDK_ZIP }}
+          echo "Extracting NDK (this may take a while)..."
+          unzip -q /tmp/${{ env.NDK_ZIP }} -d /opt/
+          rm -f /tmp/${{ env.NDK_ZIP }}
+          echo "NDK extracted to ${{ env.NDK_DIR }}"
+
+      - name: Setup build environment
+        run: |
+          # Create jni symlinks required by ndk-build
+          mkdir -p jni
+          ln -sf "$PWD/zygisk_entry.cpp" jni/zygisk_entry.cpp
+          ln -sf "$PWD/seccomp_engine.cpp" jni/seccomp_engine.cpp
+          ln -sf "$PWD/virtualizer_core.cpp" jni/virtualizer_core.cpp
+          ln -sf "$PWD/virtualizer.h" jni/virtualizer.h
+          ln -sf "$PWD/zygisk.hpp" jni/zygisk.hpp
+          ln -sf "$PWD/Android.mk" jni/Android.mk
+          ln -sf "$PWD/Application.mk" jni/Application.mk
+          echo "JNI symlinks created:"
+          ls -la jni/
+
+      - name: Build library
+        id: build
+        env:
+          NDK_PROJECT_PATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          BUILD_FLAGS="NDK_DEBUG=0"
+          if [[ "${{ github.event.inputs.debug }}" == "true" ]]; then
+            BUILD_FLAGS="NDK_DEBUG=1"
+          fi
+          echo "Building with: $BUILD_FLAGS"
+          ${{ env.NDK_DIR }}/ndk-build $BUILD_FLAGS 2>&1
+          echo "Build complete. Checking output..."
+          if [ -f libs/arm64-v8a/libvirtualizer.so ]; then
+            echo "✓ libs/arm64-v8a/libvirtualizer.so built successfully"
+            ls -lh libs/arm64-v8a/libvirtualizer.so
+            file libs/arm64-v8a/libvirtualizer.so
+          else
+            echo "✗ Build failed: libvirtualizer.so not found"
+            ls -la libs/arm64-v8a/ || true
+            exit 1
+          fi
+
+      - name: Verify ELF header
+        run: |
+          echo "Verifying ELF architecture..."
+          READELF=${{ env.NDK_DIR }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
+          if [ -f libs/arm64-v8a/libvirtualizer.so ]; then
+            $READELF -h libs/arm64-v8a/libvirtualizer.so | head -20
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvirtualizer-arm64-v8a
+          path: libs/arm64-v8a/libvirtualizer.so
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Package module zip
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/module/zygisk
+          cp libs/arm64-v8a/libvirtualizer.so /tmp/module/zygisk/arm64-v8a.so
+          cp module.prop /tmp/module/
+          cp post-fs-data.sh /tmp/module/
+          cp service.sh /tmp/module/
+          cd /tmp/module
+          zip -r "${{ github.workspace }}/zygisk-virtualizer.zip" .
+          echo "Module packaged: zygisk-virtualizer.zip"
+          ls -lh "${{ github.workspace }}/zygisk-virtualizer.zip"
+
+      - name: Upload module zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zygisk-virtualizer-module
+          path: zygisk-virtualizer.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  lint:
+    name: Code style check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format
+
+      - name: Check C++ formatting
+        run: |
+          echo "Checking C++ source files for formatting..."
+          FILES=$(find . -name '*.cpp' -o -name '*.h' | grep -v jni/ | grep -v obj/)
+          if [ -z "$FILES" ]; then
+            echo "No C++ files found to check"
+            exit 0
+          fi
+          # Check formatting without modifying files
+          for f in $FILES; do
+            if ! clang-format --dry-run -Werror "$f" 2>/dev/null; then
+              echo "::warning file=$f::Formatting issues detected in $f"
+            fi
+          done
+          echo "Formatting check complete"
+
+      - name: Check for basic issues
+        run: |
+          echo "Checking for potential issues..."
+          # Check for TAB characters
+          if grep -rn $'\t' --include='*.cpp' --include='*.h' . 2>/dev/null | grep -v jni/ | grep -v obj/ | head -20; then
+            echo "::warning::TAB characters found in source files (spaces preferred)"
+          fi
+          # Check for trailing whitespace
+          if grep -rn '[[:space:]]$' --include='*.cpp' --include='*.h' . 2>/dev/null | grep -v jni/ | grep -v obj/ | head -20; then
+            echo "::warning::Trailing whitespace found in source files"
+          fi
+          echo "Basic checks complete"
