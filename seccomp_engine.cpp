@@ -20,6 +20,36 @@ static uint32_t g_seccomp_engine_active_listeners = 0;
 static uint32_t g_seccomp_engine_total_listeners = 0;
 static VIRT_ProcHiderState *g_seccomp_engine_proc_hider = NULL;
 
+static volatile sig_atomic_t g_handler_sigterm = 0;
+static volatile sig_atomic_t g_handler_sighup = 0;
+static volatile sig_atomic_t g_handler_sigusr1 = 0;
+
+static void virt_signal_handler(int sig) {
+    switch (sig) {
+        case SIGTERM:
+        case SIGINT:
+            g_handler_sigterm = 1;
+            break;
+        case SIGHUP:
+            g_handler_sighup = 1;
+            break;
+        case SIGUSR1:
+            g_handler_sigusr1 = 1;
+            break;
+    }
+}
+
+static void virt_setup_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = virt_signal_handler;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+}
+
 const char *VIRT_DECOY_MAPS_PATH = "/data/local/tmp/clean_maps";
 const char *VIRT_DECOY_STATUS_PATH = "/data/local/tmp/clean_status";
 const char *VIRT_DECOY_MOUNTINFO_PATH = "/data/local/tmp/clean_mountinfo";
@@ -626,6 +656,8 @@ int virt_seccomp_handler_loop(void *arg) {
     int notify_fd = (int)(intptr_t)arg;
     prctl(PR_SET_NAME, "seccomp-virt", 0, 0, 0);
 
+    virt_setup_signal_handlers();
+
     struct seccomp_notif req;
     struct seccomp_notif_resp resp;
     VIRT_Watchdog watchdog;
@@ -665,6 +697,10 @@ int virt_seccomp_handler_loop(void *arg) {
     VIRT_Config decoy_cfg = VIRT_DEFAULT_CONFIG;
     if (virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &decoy_cfg) == VIRT_OK) {
         VIRT_LOGI("Handler: config loaded from %s", VIRT_DEFAULT_CONFIG.config_path);
+        int val_errors = virt_config_validate(&decoy_cfg);
+        if (val_errors > 0) {
+            VIRT_LOGW("Handler: config had %d validation warnings/errors", val_errors);
+        }
     }
     decoy_cfg.enable_file_decoy = true;
     virt_decoy_init(&decoy_cfg);
@@ -713,6 +749,8 @@ int virt_seccomp_handler_loop(void *arg) {
 
     health.active_rules = rule_count;
 
+    virt_init_default_connect_rules();
+
     virt_proc_hider_init(proc_hider);
     virt_proc_hider_add_fd(proc_hider, notify_fd);
     g_seccomp_engine_proc_hider = proc_hider;
@@ -744,6 +782,35 @@ int virt_seccomp_handler_loop(void *arg) {
             .events = POLLIN,
             .revents = 0,
         };
+
+        if (g_handler_sigterm) {
+            VIRT_LOGI("Handler: SIGTERM/SIGINT received, shutting down");
+            break;
+        }
+        if (g_handler_sighup) {
+            g_handler_sighup = 0;
+            uint32_t old_count = rule_count;
+            virt_rules_load_defaults(rules, &rule_count, VIRT_MAX_RULES);
+            int json_count = virt_rules_load_json(
+                VIRT_DEFAULT_CONFIG.rules_json_path,
+                rules, &rule_count, VIRT_MAX_RULES);
+            if (json_count >= 0) {
+                virt_rules_sort(rules, rule_count);
+                VIRT_LOGI("Handler: SIGHUP rule reload (%u -> %u rules%s)",
+                          old_count, rule_count,
+                          json_count > 0 ? ", +JSON" : "");
+            } else {
+                VIRT_LOGI("Handler: SIGHUP reloaded %u default rules (no JSON)",
+                          rule_count);
+            }
+            health.active_rules = rule_count;
+        }
+        if (g_handler_sigusr1) {
+            g_handler_sigusr1 = 0;
+            char stats_buf[2048];
+            virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
+            VIRT_LOGI("Handler: SIGUSR1 stats dump\n%s", stats_buf);
+        }
 
         int poll_rc = poll(&pfd, 1, VIRT_NOTIF_FD_TIMEOUT_MS);
         if (poll_rc < 0) {
@@ -818,7 +885,9 @@ int virt_seccomp_handler_loop(void *arg) {
 
         if (path_addr) {
             path_len = virt_seccomp_read_path(&req, path_buf,
-                                               sizeof(path_buf), path_addr);
+                                               256, path_addr);
+            if (path_len > 0 && path_len < 256) path_buf[path_len] = '\0';
+            else if (path_len >= 256) path_buf[255] = '\0';
             path_readable = (path_len > 0);
         }
 
@@ -831,6 +900,25 @@ int virt_seccomp_handler_loop(void *arg) {
 
         int action = VIRT_ACTION_PASS_THROUGH;
         bool resolved = false;
+
+        if (path_readable && path_len > 0) {
+            if (path_buf[0] == '/' &&
+                ((path_buf[1] == 's' && strncmp(path_buf, "/system/", 8) == 0) ||
+                 (path_buf[1] == 'v' && strncmp(path_buf, "/vendor/", 8) == 0) ||
+                 (path_buf[1] == 'a' && strncmp(path_buf, "/apex/", 6) == 0))) {
+                path_buf[0] = '\0';
+                path_len = -1;
+                path_readable = false;
+            }
+        }
+
+        if (path_readable && path_len > 0) {
+            if (!virt_bloom_check(path_buf, (uint32_t)path_len)) {
+                path_buf[0] = '\0';
+                path_len = -1;
+                path_readable = false;
+            }
+        }
 
         if (path_readable && path_len > 0) {
             int cached = virt_cache_lookup(cache, cache_count,
@@ -915,6 +1003,38 @@ int virt_seccomp_handler_loop(void *arg) {
             /* No match: resp unchanged → falls through to CONTINUE below */
         }
 
+        /* --- Connect Network Filter ---
+         * For __NR_connect, read the sockaddr from target memory, extract
+         * the IP address and port, then check against connect rules.
+         * Blocked connections get -ENOENT; all others pass through. */
+        if (req.data.nr == __NR_connect && !resolved) {
+            uint64_t sockaddr_ptr = req.data.args[1];
+            uint64_t addrlen = req.data.args[2];
+            if (sockaddr_ptr && addrlen >= sizeof(struct sockaddr_in)) {
+                struct sockaddr_in sa;
+                struct iovec local = { .iov_base = &sa, .iov_len = sizeof(sa) };
+                struct iovec remote = { .iov_base = (void *)(uintptr_t)sockaddr_ptr,
+                                        .iov_len = sizeof(sa) };
+                ssize_t n = syscall(__NR_process_vm_readv, (pid_t)req.pid,
+                                    &local, 1UL, &remote, 1UL, 0UL);
+                if (n >= (ssize_t)sizeof(sa) && sa.sin_family == AF_INET) {
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &sa.sin_addr, ip_str, sizeof(ip_str));
+                    uint16_t port = ntohs(sa.sin_port);
+                    int conn_action = virt_check_connect(ip_str, port);
+                    if (conn_action != VIRT_ACTION_PASS_THROUGH &&
+                        conn_action != VIRT_ACTION_ALLOW) {
+                        action = conn_action;
+                        resolved = true;
+                        snprintf(path_buf, sizeof(path_buf), "connect:%s:%u", ip_str, port);
+                        path_len = (int)strlen(path_buf);
+                        path_readable = true;
+                        VIRT_LOGD("[connect] BLOCK %s:%u -> %d", ip_str, port, conn_action);
+                    }
+                }
+            }
+        }
+
         /* --- Path Redirection Engine ---
          * For openat/openat2 on sensitive paths, project a clean decoy fd
          * into the target via SECCOMP_IOCTL_NOTIF_ADDFD (auto-sends response).
@@ -993,6 +1113,14 @@ int virt_seccomp_handler_loop(void *arg) {
                     (uintptr_t)req.data.args[0] >= sm->execution_base &&
                     (uintptr_t)req.data.args[0] < sm->execution_base + sm->segment_size)
                     send_direct = true;
+            }
+            if (req.data.nr == __NR_connect && resolved &&
+                action != VIRT_ACTION_ALLOW &&
+                action != VIRT_ACTION_PASS_THROUGH) {
+                send_direct = true;
+                resp.error = virt_errno_for_action(action);
+                resp.val = 0;
+                resp.flags = 0;
             }
             if (send_direct) {
                 rc = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);

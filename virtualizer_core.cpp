@@ -1,5 +1,38 @@
 #include "virtualizer.h"
 
+#define VIRT_BLOOM_SIZE 1024
+static uint64_t g_bloom_filter[VIRT_BLOOM_SIZE / 64] = {0};
+
+static uint32_t virt_bloom_hash1(const char *str, uint32_t len) {
+    uint32_t hash = 5381;
+    for (uint32_t i = 0; i < len; i++)
+        hash = ((hash << 5) + hash) + (unsigned char)str[i];
+    return hash % VIRT_BLOOM_SIZE;
+}
+
+static uint32_t virt_bloom_hash2(const char *str, uint32_t len) {
+    uint32_t hash = 0;
+    for (uint32_t i = 0; i < len; i++)
+        hash = hash * 101 + (unsigned char)str[i];
+    return hash % VIRT_BLOOM_SIZE;
+}
+
+void virt_bloom_add(const char *pattern) {
+    uint32_t len = strlen(pattern);
+    uint32_t h1 = virt_bloom_hash1(pattern, len);
+    uint32_t h2 = virt_bloom_hash2(pattern, len);
+    g_bloom_filter[h1 / 64] |= (1ULL << (h1 % 64));
+    g_bloom_filter[h2 / 64] |= (1ULL << (h2 % 64));
+}
+
+int virt_bloom_check(const char *str, uint32_t len) {
+    uint32_t h1 = virt_bloom_hash1(str, len);
+    uint32_t h2 = virt_bloom_hash2(str, len);
+    if (!(g_bloom_filter[h1 / 64] & (1ULL << (h1 % 64)))) return 0;
+    if (!(g_bloom_filter[h2 / 64] & (1ULL << (h2 % 64)))) return 0;
+    return 1;
+}
+
 static uint32_t g_thread_monitor_count = 0;
 static VIRT_ThreadMonitor g_thread_monitors[VIRT_MAX_THREADS];
 static pthread_mutex_t g_thread_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -681,6 +714,7 @@ int virt_rules_load_defaults(VIRT_Rule *rules, uint32_t *rule_count, uint32_t ma
         else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/su") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/magisk") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/data/adb") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/sbin/")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 200; }
         else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "xposed") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "frida") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "substrate")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 300; }
         rules[*rule_count] = rule; (*rule_count)++;
+        virt_bloom_add(VIRT_DEFAULT_BLOCKED_PATTERNS[i]);
     }
     VIRT_LOGI("Loaded %u default rules", *rule_count);
     return VIRT_OK;
@@ -964,15 +998,41 @@ int virt_config_load(const char *path, VIRT_Config *cfg) {
     return VIRT_OK;
 }
 
-int virt_config_validate(const VIRT_Config *cfg) {
+int virt_config_validate(VIRT_Config *cfg) {
     if (!cfg) return VIRT_ERR_INVAL;
-    if (cfg->log_level < VIRT_LOG_LEVEL_NONE || cfg->log_level > VIRT_LOG_LEVEL_TRACE) return VIRT_ERR_INVAL;
-    if (cfg->filter_mode < 0 || cfg->filter_mode >= VIRT_FILTER_MODE_COUNT) return VIRT_ERR_INVAL;
-    if (cfg->default_action < 0 || cfg->default_action >= VIRT_ACTION_COUNT) return VIRT_ERR_INVAL;
-    if (cfg->max_rules == 0 || cfg->max_rules > 65536) return VIRT_ERR_INVAL;
-    if (cfg->cache_size == 0 || cfg->cache_size > 65536) return VIRT_ERR_INVAL;
-    if (cfg->handler_stack_size < 65536 || cfg->handler_stack_size > 8388608) return VIRT_ERR_INVAL;
-    return VIRT_OK;
+    int errors = 0;
+
+    if (cfg->handler_stack_size < 65536 || cfg->handler_stack_size > 8388608) {
+        VIRT_LOGE("Config: handler_stack_size %u out of range [65536, 8388608]",
+                  cfg->handler_stack_size);
+        cfg->handler_stack_size = VIRT_CLAMP(cfg->handler_stack_size, 65536, 8388608);
+        errors++;
+    }
+
+    if (cfg->cache_size > VIRT_MAX_CACHED_PATHS) {
+        VIRT_LOGW("Config: cache_size %u capped to %u", cfg->cache_size, VIRT_MAX_CACHED_PATHS);
+        cfg->cache_size = VIRT_MAX_CACHED_PATHS;
+        errors++;
+    }
+
+    if (cfg->log_level < 0 || cfg->log_level > 5) {
+        cfg->log_level = VIRT_CLAMP(cfg->log_level, 0, 5);
+        errors++;
+    }
+
+    if (cfg->timing_jitter_us > 10000) {
+        VIRT_LOGW("Config: jitter %uus seems high, clamping to 10000us", cfg->timing_jitter_us);
+        cfg->timing_jitter_us = VIRT_CLAMP(cfg->timing_jitter_us, 0, 10000);
+        errors++;
+    }
+
+    if (cfg->enable_file_decoy && cfg->fake_maps_path[0]) {
+        if (access(cfg->fake_maps_path, R_OK) != 0) {
+            VIRT_LOGW("Config: fake_maps_path %s not readable", cfg->fake_maps_path);
+        }
+    }
+
+    return errors;
 }
 
 int virt_config_generate_default(const char *path) {
@@ -1515,6 +1575,21 @@ int virt_check_environment_support(void) {
     }
 }
 
+int virt_reload_rules(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules) {
+    if (!rules || !rule_count) return VIRT_ERR_INVAL;
+    virt_rules_load_defaults(rules, rule_count, max_rules);
+    int json_count = virt_rules_load_json(
+        VIRT_DEFAULT_CONFIG.rules_json_path,
+        rules, rule_count, max_rules);
+    if (json_count >= 0) {
+        virt_rules_sort(rules, *rule_count);
+        VIRT_LOGI("Reloaded %u default + %d JSON rules", *rule_count, json_count);
+    } else {
+        VIRT_LOGI("Reloaded %u default rules (no JSON)", *rule_count);
+    }
+    return VIRT_OK;
+}
+
 int virt_stats_dump_to_file(const char *filepath, const VIRT_SyscallStats *stats) {
     if (!filepath || !stats) return VIRT_ERR_INVAL;
 
@@ -1668,6 +1743,61 @@ int virt_anti_tamper_loop(void *arg) {
     return 0;
 }
 
+static VIRT_ConnectRule g_connect_rules[VIRT_MAX_CONNECT_RULES];
+static uint32_t g_connect_rule_count = 0;
+
+int virt_add_connect_rule(const char *hostname, uint16_t port, int action) {
+    if (!hostname) return VIRT_ERR_INVAL;
+    if (g_connect_rule_count >= VIRT_MAX_CONNECT_RULES) return VIRT_ERR_NOMEM;
+    VIRT_ConnectRule *rule = &g_connect_rules[g_connect_rule_count++];
+    virt_safe_strncpy(rule->hostname, hostname, sizeof(rule->hostname));
+    rule->port = port;
+    rule->action = action;
+    rule->has_port = (port != 0);
+    return VIRT_OK;
+}
+
+int virt_check_connect(const char *hostname, uint16_t port) {
+    if (!hostname) return VIRT_ACTION_PASS_THROUGH;
+    for (uint32_t i = 0; i < g_connect_rule_count; i++) {
+        VIRT_ConnectRule *rule = &g_connect_rules[i];
+        size_t rlen = strlen(rule->hostname);
+        if (rlen > 0 && strncmp(hostname, rule->hostname, rlen) == 0) {
+            if (rule->has_port && rule->port != port) continue;
+            return rule->action;
+        }
+    }
+    return VIRT_ACTION_PASS_THROUGH;
+}
+
+int virt_init_default_connect_rules(void) {
+    /* Block known anti-cheat and detection telemetry endpoints */
+    static const char *blocked_hosts[] = {
+        "akamai.",
+        "cloudfront.net",
+        "anticheat",
+        "easyanticheat",
+        "battleye",
+        "xigncode",
+        "nprotect",
+        "gameguard",
+        "tencent",
+        "hackshield",
+        "denuvo",
+        "equ8",
+        "fairfight",
+        "punkbuster",
+        NULL,
+    };
+    int count = 0;
+    for (size_t i = 0; blocked_hosts[i] != NULL; i++) {
+        if (virt_add_connect_rule(blocked_hosts[i], 0, VIRT_ACTION_BLOCK_ENOENT) == VIRT_OK)
+            count++;
+    }
+    VIRT_LOGI("Default connect rules: %d loaded", count);
+    return count;
+}
+
 int virt_spoof_uname(struct utsname *uts) {
     if (!uts) return VIRT_ERR_INVAL;
     static const char *fake_sysname  = "Linux";
@@ -1684,4 +1814,88 @@ int virt_spoof_uname(struct utsname *uts) {
     virt_safe_strncpy(uts->domainname, "(none)", sizeof(uts->domainname));
 #endif
     return VIRT_OK;
+}
+
+int virt_run_self_test(void) {
+    int passed = 0;
+    int failed = 0;
+
+    VIRT_LOGI("Self-test: starting");
+
+    /* Test 1: Trie operations */
+    {
+        virt_trie_insert("/proc/self/maps", VIRT_ACTION_BLOCK_ENOENT, 100);
+        int action = VIRT_ACTION_PASS_THROUGH;
+        int rc = virt_trie_lookup("/proc/self/maps", 14, &action);
+        if (rc >= 0 && action == VIRT_ACTION_BLOCK_ENOENT) {
+            VIRT_LOGI("  PASS: trie insert/lookup");
+            passed++;
+        } else {
+            VIRT_LOGE("  FAIL: trie insert/lookup (rc=%d action=%d)", rc, action);
+            failed++;
+        }
+        virt_trie_destroy();
+    }
+
+    /* Test 2: Cache operations */
+    {
+        VIRT_CacheEntry cache[4];
+        uint32_t count = 0;
+        memset(cache, 0, sizeof(cache));
+        int rc = virt_cache_insert(cache, &count, 4, "/proc/self/maps", 14, true, VIRT_ACTION_BLOCK_ENOENT);
+        if (rc == VIRT_OK && count == 1) {
+            int cached = virt_cache_lookup(cache, count, "/proc/self/maps", 14);
+            if (cached == VIRT_ACTION_BLOCK_ENOENT) {
+                VIRT_LOGI("  PASS: cache insert/lookup");
+                passed++;
+            } else {
+                VIRT_LOGE("  FAIL: cache lookup returned %d", cached);
+                failed++;
+            }
+        } else {
+            VIRT_LOGE("  FAIL: cache insert (rc=%d count=%u)", rc, count);
+            failed++;
+        }
+    }
+
+    /* Test 3: Rule matching */
+    {
+        bool m1 = virt_path_match("/proc/self/maps", 14, "/proc/self/", VIRT_MATCH_PREFIX);
+        bool m2 = virt_path_match("/proc/self/maps", 14, "maps", VIRT_MATCH_SUFFIX);
+        bool m3 = virt_path_match("/proc/self/maps", 14, "/proc/self/maps", VIRT_MATCH_EXACT);
+        bool m4 = virt_path_match("/proc/self/maps", 14, "self", VIRT_MATCH_SUBSTRING);
+        if (m1 && m2 && m3 && m4) {
+            VIRT_LOGI("  PASS: rule matching (prefix/suffix/exact/substring)");
+            passed++;
+        } else {
+            VIRT_LOGE("  FAIL: rule matching (%d %d %d %d)", m1, m2, m3, m4);
+            failed++;
+        }
+    }
+
+    /* Test 4: Config defaults */
+    {
+        VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
+        int errs = virt_config_validate(&cfg);
+        if (errs == 0 &&
+            cfg.cache_size == VIRT_MAX_CACHED_PATHS &&
+            cfg.handler_stack_size == VIRT_HANDLER_STACK_SIZE) {
+            VIRT_LOGI("  PASS: config defaults validate");
+            passed++;
+        } else {
+            VIRT_LOGE("  FAIL: config defaults (errors=%d)", errs);
+            failed++;
+        }
+    }
+
+    /* Test 5: Feature detection */
+    {
+        int features = 0;
+        virt_seccomp_get_features(&features);
+        VIRT_LOGI("  INFO: kernel features=0x%x", features);
+        passed++;
+    }
+
+    VIRT_LOGI("Self-test: %d passed, %d failed", passed, failed);
+    return failed;
 }

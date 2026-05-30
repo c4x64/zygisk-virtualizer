@@ -238,6 +238,16 @@ public:
             VIRT_SUPPORTED_ENVS
         );
 
+#if VIRT_DEBUG_MODE
+        VIRT_ZYGISK_LOGI("DEBUG_MODE enabled, running self-test");
+        int self_test_failed = virt_run_self_test();
+        if (self_test_failed > 0) {
+            VIRT_ZYGISK_LOGW("Self-test: %d tests failed", self_test_failed);
+        } else {
+            VIRT_ZYGISK_LOGI("Self-test: all tests passed");
+        }
+#endif
+
         if (!(features & 1)) {
             VIRT_ZYGISK_LOGW("SECCOMP_RET_USER_NOTIF not available, virtualization disabled");
             return;

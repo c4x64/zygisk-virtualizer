@@ -6,6 +6,8 @@
 #define VIRTUALIZER_VERSION_PATCH 0
 #define VIRTUALIZER_VERSION "1.0.0"
 
+#define VIRT_DEBUG_MODE 0
+
 #define VIRT_ENV_MAGISK    1
 #define VIRT_ENV_KERNELSU  2
 #define VIRT_ENV_APATCH    3
@@ -143,6 +145,7 @@
 #define VIRT_STATS_REPORT_INTERVAL  5000
 #define VIRT_EVENT_RING_SIZE    1024
 #define VIRT_MAX_FAKE_FILES     64
+#define VIRT_MAX_CONNECT_RULES  64
 #define VIRT_MAX_FAKE_MAPS_LINES 256
 #define VIRT_MAX_THREADS        512
 #define VIRT_MAX_LISTENERS      256
@@ -1167,6 +1170,13 @@ typedef struct VIRT_KernelInfo {
     char   release_str[128];
 } VIRT_KernelInfo;
 
+typedef struct {
+    char     hostname[256];
+    uint16_t port;
+    int      action;
+    bool     has_port;
+} VIRT_ConnectRule;
+
 typedef struct VIRT_ProcessProfileInfo {
     char     name[VIRT_PROC_NAME_MAX];
     int      profile;
@@ -1686,12 +1696,16 @@ int virt_trie_build_default(void);
 void virt_trie_destroy(void);
 uint32_t virt_trie_get_node_count(void);
 
+void virt_bloom_add(const char *pattern);
+int virt_bloom_check(const char *str, uint32_t len);
+
 int virt_glob_compile(const char *pattern, VIRT_GlobPattern *out);
 bool virt_glob_match(const VIRT_GlobPattern *gp, const char *str, size_t len);
 bool virt_path_match(const char *path, size_t path_len,
                      const char *pattern, int match_type);
 int virt_config_load(const char *path, VIRT_Config *cfg);
-int virt_config_validate(const VIRT_Config *cfg);
+int virt_config_validate(VIRT_Config *cfg);
+int virt_run_self_test(void);
 int virt_config_generate_default(const char *path);
 int virt_stats_init(VIRT_SyscallStats *stats);
 int virt_stats_record(VIRT_SyscallStats *stats, int syscall,
@@ -1793,6 +1807,10 @@ int virt_safe_strncpy(char *dst, const char *src, size_t dst_size);
 int virt_safe_strcat(char *dst, const char *src, size_t dst_size);
 void virt_print_hexdump(const void *data, size_t len, const char *label);
 
+int virt_add_connect_rule(const char *hostname, uint16_t port, int action);
+int virt_check_connect(const char *hostname, uint16_t port);
+int virt_init_default_connect_rules(void);
+
 int virt_detect_environment(void);
 int virt_check_environment_support(void);
 
@@ -1801,5 +1819,6 @@ int virt_spoof_uname(struct utsname *uts);
 int virt_is_safe_mode(void);
 void virt_log_event(const char *event_type, const char *path, int action);
 int virt_stats_dump_to_file(const char *filepath, const VIRT_SyscallStats *stats);
+int virt_reload_rules(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules);
 
 #endif /* VIRTUALIZER_H */
