@@ -20,6 +20,13 @@ static uint32_t g_seccomp_engine_active_listeners = 0;
 static uint32_t g_seccomp_engine_total_listeners = 0;
 static VIRT_ProcHiderState *g_seccomp_engine_proc_hider = NULL;
 
+/* Latency histogram */
+static const uint64_t g_latency_bucket_ns[VIRT_LATENCY_BUCKETS] = {
+    1000, 5000, 10000, 50000, 100000, 500000,
+    1000000, 5000000, 10000000, UINT64_MAX
+};
+static uint64_t g_latency_histogram[VIRT_LATENCY_BUCKETS] = {0};
+
 static volatile sig_atomic_t g_handler_sigterm = 0;
 static volatile sig_atomic_t g_handler_sighup = 0;
 static volatile sig_atomic_t g_handler_sigusr1 = 0;
@@ -718,8 +725,10 @@ int virt_seccomp_handler_loop(void *arg) {
     VIRT_Watchdog watchdog;
     VIRT_HealthStatus health;
     VIRT_TimingJitter jitter;
-    uint64_t event_ring[256];
-    uint32_t event_ring_pos = 0;
+    VIRT_HistoryEntry history[256];
+    uint32_t history_pos = 0;
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
     bool watchdog_ok = false;
     bool stats_ok = false;
 
@@ -817,14 +826,13 @@ int virt_seccomp_handler_loop(void *arg) {
     jitter.min_jitter_us = UINT32_MAX;
 
     VIRT_LOGI(
-        "Handler v%s started (fd=%d, continue=%s, tsync=%s, "
-        "rules=%u, cache=%u, watchdog=%s)",
-        VIRTUALIZER_VERSION,
-        notify_fd,
+        "Handler started: cache=%u rules=%u features=0x%x "
+        "continue=%s tsync=%s watchdog=%s",
+        VIRT_MAX_CACHED_PATHS,
+        rule_count,
+        g_seccomp_engine_features,
         g_seccomp_engine_has_continue ? "yes" : "no",
         g_seccomp_engine_has_tsync ? "yes" : "no",
-        rule_count,
-        VIRT_MAX_CACHED_PATHS,
         watchdog_ok ? "armed" : "disabled"
     );
 
@@ -946,11 +954,14 @@ int virt_seccomp_handler_loop(void *arg) {
             path_readable = (path_len > 0);
         }
 
-        if (event_ring_pos < 256) {
-            event_ring[event_ring_pos++] = req.id;
-        } else {
-            event_ring_pos = 0;
-            event_ring[event_ring_pos++] = req.id;
+        {
+            uint32_t hp = history_pos % 256;
+            history[hp].id = req.id;
+            history[hp].syscall_nr = req.data.nr;
+            history[hp].action = VIRT_ACTION_PASS_THROUGH;
+            history[hp].latency_ns = 0;
+            history[hp].timestamp_ns = loop_start;
+            history_pos++;
         }
 
         int action = VIRT_ACTION_PASS_THROUGH;
@@ -981,6 +992,10 @@ int virt_seccomp_handler_loop(void *arg) {
             if (cached >= 0) {
                 action = cached;
                 resolved = true;
+                cache_hits++;
+                if (stats_ok && req.data.nr >= 0 && req.data.nr < 512) {
+                    stats->per_syscall_cache_hit[req.data.nr]++;
+                }
                 if (cached != VIRT_ACTION_PASS_THROUGH) {
                     health.cache_hit_rate++;
                 }
@@ -993,11 +1008,20 @@ int virt_seccomp_handler_loop(void *arg) {
                     uint32_t plen = (uint32_t)VIRT_MAX(path_len, 0);
                     action = rule_action;
                     resolved = true;
+                    cache_misses++;
+                    if (stats_ok && req.data.nr >= 0 && req.data.nr < 512) {
+                        stats->per_syscall_cache_miss[req.data.nr]++;
+                    }
                     virt_cache_insert(cache, &cache_count,
                                        VIRT_MAX_CACHED_PATHS,
                                        path_buf, plen,
                                        action != VIRT_ACTION_PASS_THROUGH,
                                        action);
+                } else {
+                    cache_misses++;
+                    if (stats_ok && req.data.nr >= 0 && req.data.nr < 512) {
+                        stats->per_syscall_cache_miss[req.data.nr]++;
+                    }
                 }
             }
         }
@@ -1257,6 +1281,21 @@ int virt_seccomp_handler_loop(void *arg) {
         }
         g_seccomp_engine_total_latency_ns += total_time;
 
+        /* Latency histogram */
+        for (int bi = 0; bi < VIRT_LATENCY_BUCKETS; bi++) {
+            if (total_time <= g_latency_bucket_ns[bi]) {
+                g_latency_histogram[bi]++;
+                break;
+            }
+        }
+
+        /* Update history entry with final latency */
+        {
+            uint32_t hp = (history_pos - 1) % 256;
+            history[hp].latency_ns = total_time;
+            history[hp].action = action;
+        }
+
         if (stats_ok) {
             virt_stats_record(stats, req.data.nr, action, total_time);
         }
@@ -1283,7 +1322,26 @@ int virt_seccomp_handler_loop(void *arg) {
         if (health.processed_events % 5000 == 0) {
             char stats_buf[2048];
             virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
-            VIRT_LOGI("Periodic stats:\n%s", stats_buf);
+            {
+                char hist_buf[512];
+                int h_off = 0;
+                h_off += snprintf(hist_buf, sizeof(hist_buf), "LatHist:");
+                for (int bi = 0; bi < VIRT_LATENCY_BUCKETS && h_off < (int)sizeof(hist_buf) - 24; bi++) {
+                    if (g_latency_histogram[bi] == 0) continue;
+                    if (g_latency_bucket_ns[bi] == UINT64_MAX) {
+                        h_off += snprintf(hist_buf + h_off, (size_t)(sizeof(hist_buf) - h_off),
+                                          " >%lu=%lu",
+                                          (unsigned long)g_latency_bucket_ns[bi - 1],
+                                          (unsigned long)g_latency_histogram[bi]);
+                    } else {
+                        h_off += snprintf(hist_buf + h_off, (size_t)(sizeof(hist_buf) - h_off),
+                                          " <%lu=%lu",
+                                          (unsigned long)g_latency_bucket_ns[bi],
+                                          (unsigned long)g_latency_histogram[bi]);
+                    }
+                }
+                VIRT_LOGI("Periodic stats:\n%s\n%s", stats_buf, hist_buf);
+            }
         }
 
         if (health.processed_events % 1000 == 0) {
@@ -1305,16 +1363,57 @@ int virt_seccomp_handler_loop(void *arg) {
 
     double avg_lat = g_seccomp_engine_total_latency_ns /
                      (double)VIRT_MAX(health.processed_events, 1ULL);
+    double cache_hit_pct = (cache_hits + cache_misses) > 0
+        ? 100.0 * (double)cache_hits / (double)(cache_hits + cache_misses) : 0.0;
+
     VIRT_LOGI(
-        "Handler exit: events=%lu blocked=%lu errors=%lu "
-        "avg_lat=%.0fns max_lat=%luns continue_fb=%lu",
+        "Handler shutdown: total=%lu blocked=%lu errors=%lu "
+        "avg_lat=%.0fus max_lat=%luns cache_hit=%.0f%% "
+        "continue_fb=%lu",
         (unsigned long)health.processed_events,
         (unsigned long)health.blocked_events,
         (unsigned long)g_seccomp_engine_errors,
-        avg_lat,
+        avg_lat / 1000.0,
         (unsigned long)g_seccomp_engine_max_latency_ns,
+        cache_hit_pct,
         (unsigned long)g_seccomp_engine_continue_fallback
     );
+
+    /* Per-syscall summary */
+    {
+        char syscall_buf[1024];
+        int sc_off = 0;
+        for (int i = 0; i < 512; i++) {
+            if (stats->per_syscall[i] > 0) {
+                sc_off += snprintf(syscall_buf + sc_off,
+                                   (size_t)VIRT_MAX(1024 - sc_off, 0),
+                                   "[%d]=%lu ", i,
+                                   (unsigned long)stats->per_syscall[i]);
+            }
+        }
+        VIRT_LOGI("Per-syscall: %s", syscall_buf);
+    }
+
+    /* Periodic histogram dump */
+    {
+        char hist_buf[512];
+        int h_off = 0;
+        h_off += snprintf(hist_buf, sizeof(hist_buf), "Latency histogram (ns):");
+        for (int bi = 0; bi < VIRT_LATENCY_BUCKETS && g_latency_histogram[bi] > 0; bi++) {
+            int old = h_off;
+            if (g_latency_bucket_ns[bi] == UINT64_MAX) {
+                h_off += snprintf(hist_buf + h_off, (size_t)VIRT_MAX((int)sizeof(hist_buf) - h_off, 0),
+                                  " >%lu=%lu", (unsigned long)g_latency_bucket_ns[bi - 1],
+                                  (unsigned long)g_latency_histogram[bi]);
+            } else {
+                h_off += snprintf(hist_buf + h_off, (size_t)VIRT_MAX((int)sizeof(hist_buf) - h_off, 0),
+                                  " <%lu=%lu", (unsigned long)g_latency_bucket_ns[bi],
+                                  (unsigned long)g_latency_histogram[bi]);
+            }
+            if (h_off >= (int)sizeof(hist_buf) - 1) { h_off = old; break; }
+        }
+        VIRT_LOGI("%s", hist_buf);
+    }
 
     free(cache);
     free(rules);

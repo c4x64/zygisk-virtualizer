@@ -32,6 +32,11 @@ esac
 ui_print "- Extracting module files"
 unzip -o "$ZIPFILE" -d "$MODPATH" >/dev/null 2>&1
 
+# Extract kernel module if present
+if [ -f "$MODPATH/kernel/virtualizer_kern.ko" ]; then
+    ui_print "- Kernel module detected in archive"
+fi
+
 # Handle sepolicy.rule for KernelSU/APatch
 if [ -f "$MODPATH/sepolicy.rule" ]; then
     if [ "$ENVIRONMENT" = "KernelSU" ] || [ "$ENVIRONMENT" = "APatch" ]; then

@@ -577,6 +577,9 @@ int virt_stats_init(VIRT_SyscallStats *stats) {
     stats->history_index = 0;
     stats->history_count = 0;
     stats->handler_lifespan_ns = 0;
+    for (int i = 0; i < 512; i++) {
+        stats->per_syscall_min[i] = UINT64_MAX;
+    }
     return VIRT_OK;
 }
 
@@ -586,7 +589,16 @@ int virt_stats_record(VIRT_SyscallStats *stats, int syscall, int action, uint64_
     stats->total_latency_ns += latency;
     if (latency > stats->max_latency_ns) stats->max_latency_ns = latency;
     if (latency < stats->min_latency_ns) stats->min_latency_ns = latency;
-    if (syscall >= 0 && syscall < 512) stats->per_syscall[syscall]++;
+    if (syscall >= 0 && syscall < 512) {
+        stats->per_syscall[syscall]++;
+        stats->per_syscall_latency[syscall] += latency;
+        if (latency > stats->per_syscall_max[syscall])
+            stats->per_syscall_max[syscall] = latency;
+        if (latency < stats->per_syscall_min[syscall])
+            stats->per_syscall_min[syscall] = latency;
+        if (action >= 0 && action < VIRT_ACTION_COUNT)
+            stats->per_syscall_action[syscall][action]++;
+    }
     if (action >= 0 && action < VIRT_ACTION_COUNT) stats->per_action[action]++;
     switch (action) {
         case VIRT_ACTION_BLOCK_ENOENT...VIRT_ACTION_FAKE_STATUS: stats->blocked_calls++; break;
@@ -609,6 +621,11 @@ int virt_stats_record(VIRT_SyscallStats *stats, int syscall, int action, uint64_
     return VIRT_OK;
 }
 
+typedef struct {
+    int nr;
+    uint64_t count;
+} VIRT_TopEntry;
+
 int virt_stats_snapshot(const VIRT_SyscallStats *stats, char *buf, size_t buf_size) {
     if (!stats || !buf || !buf_size) return VIRT_ERR_INVAL;
     uint64_t now = virt_gettime_ns();
@@ -617,21 +634,92 @@ int virt_stats_snapshot(const VIRT_SyscallStats *stats, char *buf, size_t buf_si
     off += snprintf(buf + off, buf_size - (size_t)off, "=== Virtualizer Stats v%s ===\n", VIRTUALIZER_VERSION);
     off += snprintf(buf + off, buf_size - (size_t)off, "Uptime:       %10.1f sec\n", uptime);
     off += snprintf(buf + off, buf_size - (size_t)off, "Total:        %10lu\n", (unsigned long)stats->total_calls);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Rate:         %10.1f events/sec\n", stats->calls_per_sec);
     off += snprintf(buf + off, buf_size - (size_t)off, "Blocked:      %10lu (%5.1f%%)\n", (unsigned long)stats->blocked_calls, stats->blocked_percent);
     off += snprintf(buf + off, buf_size - (size_t)off, "Passthrough:  %10lu\n", (unsigned long)stats->continued_calls);
     off += snprintf(buf + off, buf_size - (size_t)off, "Allowed:      %10lu\n", (unsigned long)stats->allowed_calls);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Errors:       %10lu\n", (unsigned long)stats->error_calls);
     off += snprintf(buf + off, buf_size - (size_t)off, "Calls/sec:    %10.1f\n", stats->calls_per_sec);
-    off += snprintf(buf + off, buf_size - (size_t)off, "Avg Lat:      %10.0f ns\n", stats->avg_latency_ns);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Avg Lat:      %10.0f ns (%.2f us)\n",
+                    stats->avg_latency_ns, stats->avg_latency_ns / 1000.0);
     off += snprintf(buf + off, buf_size - (size_t)off, "Max Lat:      %10lu ns\n", (unsigned long)stats->max_latency_ns);
     off += snprintf(buf + off, buf_size - (size_t)off, "Min Lat:      %10lu ns\n", (unsigned long)stats->min_latency_ns);
-    off += snprintf(buf + off, buf_size - (size_t)off, "\nPer-Syscall:\n");
-    for (int i = 0; i < 512; i++)
-        if (stats->per_syscall[i] > 0)
-            off += snprintf(buf + off, buf_size - (size_t)off, "  %-16s %lu\n", virt_syscall_name(i), (unsigned long)stats->per_syscall[i]);
+
+    /* Cache hit rate */
+    uint64_t total_cache = 0;
+    uint64_t total_cache_hits = 0;
+    for (int i = 0; i < 512; i++) {
+        total_cache_hits += stats->per_syscall_cache_hit[i];
+        total_cache += stats->per_syscall_cache_hit[i] + stats->per_syscall_cache_miss[i];
+    }
+    double cache_pct = total_cache > 0 ? 100.0 * (double)total_cache_hits / (double)total_cache : 0.0;
+    off += snprintf(buf + off, buf_size - (size_t)off, "Cache:        %10lu hits / %lu total (%5.1f%%)\n",
+                    (unsigned long)total_cache_hits, (unsigned long)total_cache, cache_pct);
+
+    /* Top 10 syscalls by count */
+    {
+        VIRT_TopEntry top[VIRT_STATS_TOP_SYSCALLS];
+        memset(top, 0, sizeof(top));
+        for (int i = 0; i < 512; i++) {
+            if (stats->per_syscall[i] == 0) continue;
+            uint64_t cnt = stats->per_syscall[i];
+            for (int j = 0; j < VIRT_STATS_TOP_SYSCALLS; j++) {
+                if (cnt > top[j].count) {
+                    if (j < VIRT_STATS_TOP_SYSCALLS - 1)
+                        memmove(&top[j + 1], &top[j],
+                                (size_t)(VIRT_STATS_TOP_SYSCALLS - j - 1) * sizeof(VIRT_TopEntry));
+                    top[j].nr = i;
+                    top[j].count = cnt;
+                    break;
+                }
+            }
+        }
+        off += snprintf(buf + off, buf_size - (size_t)off, "\nTop %d Syscalls:\n", VIRT_STATS_TOP_SYSCALLS);
+        for (int j = 0; j < VIRT_STATS_TOP_SYSCALLS && top[j].count > 0; j++) {
+            int nr = top[j].nr;
+            double avg_s = stats->per_syscall[nr] > 0
+                ? (double)stats->per_syscall_latency[nr] / (double)stats->per_syscall[nr] : 0.0;
+            uint64_t max_s = stats->per_syscall_max[nr];
+            uint64_t hits = stats->per_syscall_cache_hit[nr];
+            uint64_t misses = stats->per_syscall_cache_miss[nr];
+            off += snprintf(buf + off, buf_size - (size_t)off,
+                "  [%3d] %-12s cnt=%6lu avg=%6.0fns max=%6luns "
+                "cache=%lu/%lu",
+                nr, virt_syscall_name(nr),
+                (unsigned long)top[j].count,
+                avg_s,
+                (unsigned long)max_s,
+                (unsigned long)hits,
+                (unsigned long)(hits + misses));
+            /* Show primary action for this syscall */
+            uint64_t best_action_count = 0;
+            int best_action = -1;
+            for (int a = 0; a < VIRT_ACTION_COUNT; a++) {
+                if (stats->per_syscall_action[nr][a] > best_action_count) {
+                    best_action_count = stats->per_syscall_action[nr][a];
+                    best_action = a;
+                }
+            }
+            if (best_action >= 0) {
+                off += snprintf(buf + off, buf_size - (size_t)off,
+                                " act=%s(%lu)",
+                                VIRT_ACTION_NAMES[best_action],
+                                (unsigned long)best_action_count);
+            }
+            off += snprintf(buf + off, buf_size - (size_t)off, "\n");
+        }
+    }
+
     off += snprintf(buf + off, buf_size - (size_t)off, "\nPer-Action:\n");
     for (int i = 0; i < VIRT_ACTION_COUNT; i++)
         if (stats->per_action[i] > 0)
             off += snprintf(buf + off, buf_size - (size_t)off, "  %-16s %lu\n", VIRT_ACTION_NAMES[i], (unsigned long)stats->per_action[i]);
+
+    off += snprintf(buf + off, buf_size - (size_t)off, "\nPer-Category:\n");
+    for (int i = 0; i < VIRT_CAT_COUNT; i++)
+        if (stats->per_category[i] > 0)
+            off += snprintf(buf + off, buf_size - (size_t)off, "  %-16s %lu\n", VIRT_CATEGORY_NAMES[i], (unsigned long)stats->per_category[i]);
+
     return VIRT_MIN(off, (int)buf_size - 1);
 }
 

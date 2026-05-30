@@ -145,6 +145,8 @@
 #define VIRT_HEALTH_REPORT_INTERVAL 5000
 #define VIRT_STATS_REPORT_INTERVAL  5000
 #define VIRT_EVENT_RING_SIZE    1024
+#define VIRT_LATENCY_BUCKETS   10
+#define VIRT_STATS_TOP_SYSCALLS 10
 #define VIRT_MAX_FAKE_FILES     64
 #define VIRT_MAX_CONNECT_RULES  64
 #define VIRT_MAX_FAKE_MAPS_LINES 256
@@ -833,6 +835,12 @@ typedef struct VIRT_SyscallStats {
     uint64_t fallback_calls;
     uint64_t error_calls;
     uint64_t per_syscall[512];
+    uint64_t per_syscall_latency[512];
+    uint64_t per_syscall_max[512];
+    uint64_t per_syscall_min[512];
+    uint64_t per_syscall_cache_hit[512];
+    uint64_t per_syscall_cache_miss[512];
+    uint64_t per_syscall_action[512][VIRT_ACTION_COUNT];
     uint64_t per_action[VIRT_ACTION_COUNT];
     uint64_t per_category[VIRT_CAT_COUNT];
     uint64_t total_latency_ns;
@@ -945,6 +953,14 @@ typedef struct VIRT_SyscallEvent {
     int      response_error;
     int      response_val;
 } VIRT_SyscallEvent;
+
+typedef struct {
+    uint64_t id;
+    int      syscall_nr;
+    int      action;
+    uint64_t latency_ns;
+    uint64_t timestamp_ns;
+} VIRT_HistoryEntry;
 
 typedef struct VIRT_EventRing {
     VIRT_SyscallEvent events[VIRT_EVENT_RING_SIZE];

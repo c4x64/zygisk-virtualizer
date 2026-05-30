@@ -8,6 +8,11 @@ CRASH_FILE=$VIRT_DIR/.crash_count
 MAX_CRASHES=3
 GITHUB_REPO="prabhas/zygisk-virtualizer"
 
+# Load kernel module if available
+if [ -f $MODDIR/kernel/virtualizer_kern.ko ]; then
+    insmod $MODDIR/kernel/virtualizer_kern.ko 2>/dev/null
+fi
+
 # Ensure runtime directories exist
 mkdir -p $LOG_DIR
 
