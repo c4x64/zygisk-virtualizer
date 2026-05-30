@@ -1,0 +1,6 @@
+id=zygisk-virtualizer
+name=Universal Syscall Virtualization Framework
+version=v1.0.0
+versionCode=1
+author=droid-re-chain
+description=Global system call cloaking sandbox using SECCOMP_RET_USER_NOTIF to virtualize sensitive environment paths across all applications. Intercepts openat/readlinkat/faccessat natively and autonomously blocks root/magisk/anti-cheat path detection without ptrace overhead.

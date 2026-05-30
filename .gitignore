@@ -1,0 +1,8 @@
+libs/
+obj/
+jni/
+zygisk-virtualizer/
+*.zip
+*.iml
+.idea/
+.DS_Store

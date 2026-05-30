@@ -1,0 +1,1191 @@
+#include "virtualizer.h"
+
+static uint32_t g_thread_monitor_count = 0;
+static VIRT_ThreadMonitor g_thread_monitors[VIRT_MAX_THREADS];
+static pthread_mutex_t g_thread_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct TrieNode {
+    char c;
+    bool is_end;
+    int action;
+    int match_type;
+    uint32_t priority;
+    struct TrieNode *children[256];
+    struct TrieNode *fallback;
+    uint32_t hit_count;
+    uint64_t created_ns;
+    uint64_t last_hit_ns;
+} TrieNode;
+
+static TrieNode *g_trie_root = NULL;
+static uint32_t g_trie_node_count = 0;
+static uint64_t g_trie_total_lookups = 0;
+static uint64_t g_trie_cache_hits = 0;
+static pthread_mutex_t g_trie_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static TrieNode *trie_node_alloc(char c) {
+    TrieNode *node = (TrieNode *)calloc(1, sizeof(TrieNode));
+    if (!node) return NULL;
+    node->c = c;
+    node->is_end = false;
+    node->action = VIRT_ACTION_PASS_THROUGH;
+    node->match_type = VIRT_MATCH_EXACT;
+    node->priority = 0;
+    node->fallback = NULL;
+    node->hit_count = 0;
+    node->created_ns = virt_gettime_ns();
+    node->last_hit_ns = 0;
+    for (int i = 0; i < 256; i++) node->children[i] = NULL;
+    __sync_fetch_and_add(&g_trie_node_count, 1);
+    return node;
+}
+
+static void trie_node_free_recursive(TrieNode *node) {
+    if (!node) return;
+    for (int i = 0; i < 256; i++) {
+        if (node->children[i]) trie_node_free_recursive(node->children[i]);
+    }
+    free(node);
+    __sync_fetch_and_sub(&g_trie_node_count, 1);
+}
+
+int virt_trie_insert(const char *path, int action, uint32_t priority) {
+    if (!path || !path[0]) return VIRT_ERR_INVAL;
+
+    pthread_mutex_lock(&g_trie_lock);
+
+    if (!g_trie_root) {
+        g_trie_root = trie_node_alloc('\0');
+        if (!g_trie_root) { pthread_mutex_unlock(&g_trie_lock); return VIRT_ERR_NOMEM; }
+    }
+
+    TrieNode *node = g_trie_root;
+    size_t len = strlen(path);
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)path[i];
+        if (!node->children[c]) {
+            node->children[c] = trie_node_alloc((char)c);
+            if (!node->children[c]) { pthread_mutex_unlock(&g_trie_lock); return VIRT_ERR_NOMEM; }
+            if (node != g_trie_root && node->fallback) {
+                TrieNode *fb = node->fallback;
+                while (fb && !fb->children[c]) fb = fb->fallback;
+                if (fb) node->children[c]->fallback = fb->children[c];
+                else node->children[c]->fallback = g_trie_root;
+            } else {
+                node->children[c]->fallback = g_trie_root;
+            }
+        }
+        node = node->children[c];
+    }
+
+    if (!node->is_end || priority > node->priority) {
+        node->is_end = true;
+        node->action = action;
+        node->match_type = VIRT_MATCH_PREFIX;
+        node->priority = priority;
+    }
+
+    pthread_mutex_unlock(&g_trie_lock);
+    return VIRT_OK;
+}
+
+int virt_trie_lookup(const char *path, size_t path_len, int *out_action) {
+    if (!path || !out_action) return VIRT_ERR_INVAL;
+    *out_action = VIRT_ACTION_PASS_THROUGH;
+
+    __sync_fetch_and_add(&g_trie_total_lookups, 1);
+    pthread_mutex_lock(&g_trie_lock);
+
+    if (!g_trie_root) { pthread_mutex_unlock(&g_trie_lock); return VIRT_ERR_NOENT; }
+
+    TrieNode *node = g_trie_root;
+    int best_action = VIRT_ACTION_PASS_THROUGH;
+    uint32_t best_priority = 0;
+
+    for (size_t i = 0; i < path_len && node; i++) {
+        unsigned char c = (unsigned char)path[i];
+        while (node && !node->children[c]) node = node->fallback;
+        if (!node) { node = g_trie_root; continue; }
+        node = node->children[c];
+        if (node->is_end && node->priority > best_priority) {
+            best_action = node->action;
+            best_priority = node->priority;
+            __sync_fetch_and_add(&g_trie_cache_hits, 1);
+        }
+    }
+
+    pthread_mutex_unlock(&g_trie_lock);
+
+    if (best_priority > 0) {
+        *out_action = best_action;
+        return VIRT_OK;
+    }
+    return VIRT_ERR_NOENT;
+}
+
+int virt_trie_build_default(void) {
+    int rc = VIRT_OK;
+    for (size_t i = 0; VIRT_DEFAULT_BLOCKED_PATTERNS[i] != NULL; i++) {
+        uint32_t prio = 100;
+        if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/proc/self/")) prio = 100;
+        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/su") ||
+                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/magisk") ||
+                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/data/adb") ||
+                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/sbin/"))
+            prio = 200;
+        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "frida") ||
+                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "xposed") ||
+                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "substrate"))
+            prio = 300;
+        rc = virt_trie_insert(VIRT_DEFAULT_BLOCKED_PATTERNS[i], VIRT_ACTION_BLOCK_ENOENT, prio);
+        if (rc < 0) break;
+    }
+    VIRT_LOGI("Trie built: %u nodes, %zu patterns", g_trie_node_count,
+              sizeof(VIRT_DEFAULT_BLOCKED_PATTERNS) / sizeof(VIRT_DEFAULT_BLOCKED_PATTERNS[0]) - 1);
+    return rc;
+}
+
+void virt_trie_destroy(void) {
+    pthread_mutex_lock(&g_trie_lock);
+    if (g_trie_root) { trie_node_free_recursive(g_trie_root); g_trie_root = NULL; }
+    g_trie_node_count = 0;
+    g_trie_total_lookups = 0;
+    g_trie_cache_hits = 0;
+    pthread_mutex_unlock(&g_trie_lock);
+}
+
+uint32_t virt_trie_get_node_count(void) {
+    return g_trie_node_count;
+}
+
+int virt_event_ring_init(VIRT_EventRing *ring) {
+    if (!ring) return VIRT_ERR_INVAL;
+    memset(ring, 0, sizeof(*ring));
+    ring->write_pos = 0;
+    ring->read_pos = 0;
+    ring->count = 0;
+    ring->overflow = false;
+    return VIRT_OK;
+}
+
+int virt_event_ring_push(VIRT_EventRing *ring, const VIRT_SyscallEvent *evt) {
+    if (!ring || !evt) return VIRT_ERR_INVAL;
+    ring->events[ring->write_pos] = *evt;
+    ring->write_pos = (ring->write_pos + 1) % VIRT_EVENT_RING_SIZE;
+    if (ring->count < VIRT_EVENT_RING_SIZE) {
+        ring->count++;
+    } else {
+        ring->read_pos = (ring->read_pos + 1) % VIRT_EVENT_RING_SIZE;
+        ring->overflow = true;
+    }
+    return VIRT_OK;
+}
+
+int virt_event_ring_pop(VIRT_EventRing *ring, VIRT_SyscallEvent *evt) {
+    if (!ring || !evt || ring->count == 0) return VIRT_ERR_NOENT;
+    *evt = ring->events[ring->read_pos];
+    ring->read_pos = (ring->read_pos + 1) % VIRT_EVENT_RING_SIZE;
+    ring->count--;
+    return VIRT_OK;
+}
+
+int virt_event_ring_peek(const VIRT_EventRing *ring, uint32_t offset, VIRT_SyscallEvent *evt) {
+    if (!ring || !evt || offset >= ring->count) return VIRT_ERR_NOENT;
+    uint32_t idx = (ring->read_pos + offset) % VIRT_EVENT_RING_SIZE;
+    *evt = ring->events[idx];
+    return VIRT_OK;
+}
+
+uint32_t virt_event_ring_count(const VIRT_EventRing *ring) {
+    return ring ? ring->count : 0;
+}
+
+int virt_kernel_probe(VIRT_KernelInfo *info) {
+    if (!info) return VIRT_ERR_INVAL;
+    memset(info, 0, sizeof(*info));
+
+    FILE *f = fopen("/proc/sys/kernel/osrelease", "r");
+    if (f) {
+        if (fgets(info->release_str, sizeof(info->release_str), f)) {
+            char *nl = strchr(info->release_str, '\n');
+            if (nl) *nl = '\0';
+            int n = sscanf(info->release_str, "%d.%d.%d", &info->major, &info->minor, &info->patch);
+            if (n < 2) { info->major = 0; info->minor = 0; info->patch = 0; }
+        }
+        fclose(f);
+    }
+
+    snprintf(info->version_str, sizeof(info->version_str), "%d.%d.%d",
+             info->major, info->minor, info->patch);
+
+    int features = 0;
+    virt_seccomp_get_features(&features);
+    info->features_mask = features;
+    info->has_user_notif   = !!(features & 1);
+    info->has_new_listener = !!(features & 2);
+    info->has_tsync        = !!(features & 4);
+    info->has_log          = !!(features & 8);
+    info->has_user_notif  ? info->has_continue = true : false;
+    info->has_tsync_esrch = !!(features & 32);
+    info->has_notif_sizes = !!(features & 64);
+
+    VIRT_LOGI("Kernel: %s features=0x%x", info->release_str, features);
+    return VIRT_OK;
+}
+
+int virt_process_profile_detect(VIRT_ProcessProfileInfo *info) {
+    if (!info) return VIRT_ERR_INVAL;
+    if (!info->name[0]) { info->profile = VIRT_PROFILE_UNKNOWN; return VIRT_OK; }
+
+    const char *n = info->name;
+    if (strstr(n, "com.tencent") || strstr(n, "com.miHoYo") ||
+        strstr(n, "com.netease") || strstr(n, "com.garena") ||
+        strstr(n, "com.activision") || strstr(n, "com.ea.game") ||
+        strstr(n, "com.epicgames") || strstr(n, "com.roblox") ||
+        strstr(n, "com.riotgames") || strstr(n, "com.valve") ||
+        strstr(n, "com.kiloo") || strstr(n, "com.supercell") ||
+        strstr(n, "com.king") || strstr(n, "com.zynga")) {
+        info->profile = VIRT_PROFILE_GAME;
+        info->is_game = true;
+    } else if (strstr(n, "com.android.chrome") ||
+               strstr(n, "org.mozilla.firefox") ||
+               strstr(n, "com.opera") || strstr(n, "com.brave") ||
+               strstr(n, "com.microsoft.emmx") ||
+               strstr(n, "com.duckduckgo.mobile.android") ||
+               strstr(n, "com.vivaldi")) {
+        info->profile = VIRT_PROFILE_BROWSER;
+        info->is_browser = true;
+    } else if (strstr(n, "bank") || strstr(n, "pay") ||
+               strstr(n, "fintech") || strstr(n, "wallet") ||
+               strstr(n, "com.sbi") || strstr(n, "com.hdfc") ||
+               strstr(n, "com.icici")) {
+        info->profile = VIRT_PROFILE_BANKING;
+        info->is_banking = true;
+    }
+
+    if (strstr(n, "anticheat") || strstr(n, "guard") ||
+        strstr(n, "protect") || strstr(n, "security") ||
+        strstr(n, "safe") || strstr(n, "xigncode") ||
+        strstr(n, "battleye") || strstr(n, "easyanticheat") ||
+        strstr(n, "nprotect") || strstr(n, "gameguard")) {
+        info->has_anticheat = true;
+    }
+
+    return VIRT_OK;
+}
+
+int virt_cache_flush(VIRT_CacheEntry *cache, uint32_t *cache_count) {
+    if (!cache || !cache_count) return VIRT_ERR_INVAL;
+    memset(cache, 0, sizeof(VIRT_CacheEntry) * (*cache_count));
+    *cache_count = 0;
+    return VIRT_OK;
+}
+
+int virt_rules_count_by_action(const VIRT_Rule *rules, uint32_t rule_count, int action) {
+    if (!rules) return 0;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < rule_count; i++)
+        if (rules[i].enabled && rules[i].action == action) count++;
+    return (int)count;
+}
+
+int virt_rules_count_by_category(const VIRT_Rule *rules, uint32_t rule_count, int category) {
+    if (!rules) return 0;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < rule_count; i++)
+        if (rules[i].enabled && rules[i].category == category) count++;
+    return (int)count;
+}
+
+int virt_proc_hider_remove_pid(VIRT_ProcHiderState *state, pid_t pid) {
+    if (!state || pid < 0) return VIRT_ERR_INVAL;
+    for (uint32_t i = 0; i < state->hidden_pid_count; i++) {
+        if (state->hidden_pids[i] == (uint32_t)pid) {
+            for (uint32_t j = i; j < state->hidden_pid_count - 1; j++)
+                state->hidden_pids[j] = state->hidden_pids[j + 1];
+            state->hidden_pid_count--;
+            return VIRT_OK;
+        }
+    }
+    return VIRT_ERR_NOENT;
+}
+
+int virt_proc_hider_add_tid(VIRT_ProcHiderState *state, pid_t tid) {
+    if (!state || tid < 0) return VIRT_ERR_INVAL;
+    for (uint32_t i = 0; i < state->hidden_tid_count; i++)
+        if (state->hidden_tids[i] == (uint32_t) tid) return VIRT_OK;
+    if (state->hidden_tid_count < ARRAY_COUNT(state->hidden_tids))
+        state->hidden_tids[state->hidden_tid_count++] = (uint32_t) tid;
+    return VIRT_OK;
+}
+
+int virt_anti_tamper_check_memory(VIRT_AntiTamperState *state) {
+    if (!state || !state->initialized) return VIRT_ERR_INVAL;
+    if (state->module_size == 0) return VIRT_OK;
+
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return VIRT_ERR_GENERIC;
+
+    char buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return VIRT_ERR_GENERIC;
+    buf[n] = '\0';
+
+    char *line = buf;
+    bool modified = false;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        uintptr_t start, end;
+        char perm[8], path[256] = "";
+        if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*d %255s", &start, &end, perm, path) >= 3) {
+            if (start <= state->module_base && state->module_base < end) {
+                if (perm[0] == 'r' && perm[2] == 'x') {
+                    if (perm[1] == 'w') {
+                        state->code_page_writable = true;
+                        modified = true;
+                    }
+                }
+            }
+        }
+        if (nl) line = nl + 1; else break;
+    }
+
+    if (modified) {
+        state->integrity_failures++;
+        state->memory_modified = true;
+        VIRT_LOGW("Memory integrity: code page writable detected!");
+        return VIRT_ERR_CORRUPT;
+    }
+
+    return VIRT_OK;
+}
+
+int virt_anti_tamper_check_code(VIRT_AntiTamperState *state) {
+    if (!state || !state->initialized) return VIRT_ERR_INVAL;
+
+    Dl_info info;
+    if (!dladdr((void *)virt_anti_tamper_check_code, &info)) return VIRT_ERR_NOENT;
+
+    int fd = open(info.dli_fname, O_RDONLY);
+    if (fd < 0) return VIRT_ERR_GENERIC;
+
+    char hdr[4096];
+    ssize_t n = read(fd, hdr, sizeof(hdr));
+    close(fd);
+
+    if (n > 0) {
+        uint32_t hash = virt_hash_fnv1a(hdr, (size_t)n);
+        if (state->expected_text_hash != 0 && hash != state->expected_text_hash) {
+            state->integrity_failures++;
+            state->integrity_ok = false;
+            VIRT_LOGW("Code integrity: hash mismatch (0x%x != 0x%x)",
+                      hash, state->expected_text_hash);
+            return VIRT_ERR_CORRUPT;
+        }
+        if (state->expected_text_hash == 0) {
+            state->expected_text_hash = hash;
+        }
+    }
+
+    return VIRT_OK;
+}
+
+int virt_glob_compile(const char *pattern, VIRT_GlobPattern *out) {
+    if (!pattern || !out) return VIRT_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    virt_safe_strncpy(out->pattern, pattern, sizeof(out->pattern));
+    out->pattern_len = (uint32_t)strlen(pattern);
+    out->has_wildcard = false;
+    out->has_doublestar = false;
+    out->prefix_len = 0;
+    out->suffix_len = 0;
+    out->literal_prefix[0] = '\0';
+    out->literal_suffix[0] = '\0';
+
+    for (uint32_t i = 0; i < out->pattern_len; i++) {
+        if (pattern[i] == '*' || pattern[i] == '?') {
+            out->has_wildcard = true;
+            if (pattern[i] == '*' && i + 1 < out->pattern_len && pattern[i + 1] == '*')
+                out->has_doublestar = true;
+            break;
+        }
+    }
+
+    if (!out->has_wildcard) {
+        memcpy(out->literal_prefix, pattern, out->pattern_len);
+        out->literal_prefix[out->pattern_len] = '\0';
+        out->prefix_len = out->pattern_len;
+        return VIRT_OK;
+    }
+
+    uint32_t first_wc = out->pattern_len, last_wc = 0;
+    for (uint32_t i = 0; i < out->pattern_len; i++) {
+        if (pattern[i] == '*' || pattern[i] == '?') {
+            if (first_wc == out->pattern_len) first_wc = i;
+            last_wc = i;
+        }
+    }
+
+    if (first_wc > 0) {
+        memcpy(out->literal_prefix, pattern, first_wc);
+        out->literal_prefix[first_wc] = '\0';
+        out->prefix_len = first_wc;
+    }
+
+    if (last_wc < out->pattern_len - 1) {
+        uint32_t ss = last_wc + 1;
+        out->suffix_len = out->pattern_len - ss;
+        memcpy(out->literal_suffix, pattern + ss, out->suffix_len);
+        out->literal_suffix[out->suffix_len] = '\0';
+    }
+
+    uint32_t seg_idx = 0, seg_start = 0;
+    for (uint32_t i = 0; i <= out->pattern_len && seg_idx < 64; i++) {
+        if (i == out->pattern_len || pattern[i] == '*' || pattern[i] == '?') {
+            if (i > seg_start && seg_idx < 64) {
+                out->segments[seg_idx].start = seg_start;
+                out->segments[seg_idx].len = i - seg_start;
+                out->segments[seg_idx].is_wildcard = false;
+                seg_idx++;
+            }
+            if (i < out->pattern_len && seg_idx < 64) {
+                out->segments[seg_idx].start = i;
+                out->segments[seg_idx].len = 1;
+                out->segments[seg_idx].is_wildcard = true;
+                out->segments[seg_idx].is_starstar = (pattern[i] == '*' && i + 1 < out->pattern_len && pattern[i + 1] == '*');
+                seg_idx++;
+                if (out->segments[seg_idx - 1].is_starstar) i++;
+            }
+            seg_start = i + 1;
+        }
+    }
+    out->segment_count = seg_idx;
+    return VIRT_OK;
+}
+
+bool virt_glob_match(const VIRT_GlobPattern *gp, const char *str, size_t len) {
+    if (!gp || !str) return false;
+    if (!gp->has_wildcard) return len == gp->pattern_len && memcmp(str, gp->pattern, len) == 0;
+    if (gp->prefix_len > 0) {
+        if (len < gp->prefix_len) return false;
+        if (memcmp(str, gp->literal_prefix, gp->prefix_len) != 0) return false;
+    }
+    if (gp->suffix_len > 0) {
+        if (len < gp->suffix_len) return false;
+        if (memcmp(str + len - gp->suffix_len, gp->literal_suffix, gp->suffix_len) != 0) return false;
+    }
+    return true;
+}
+
+bool virt_path_match(const char *path, size_t path_len, const char *pattern, int match_type) {
+    if (!path || !pattern) return false;
+    size_t plen = strlen(pattern);
+    switch (match_type) {
+        case VIRT_MATCH_EXACT: return path_len == plen && memcmp(path, pattern, plen) == 0;
+        case VIRT_MATCH_PREFIX: return path_len >= plen && memcmp(path, pattern, plen) == 0;
+        case VIRT_MATCH_SUFFIX: return path_len >= plen && memcmp(path + path_len - plen, pattern, plen) == 0;
+        case VIRT_MATCH_SUBSTRING: {
+            if (plen > path_len) return false;
+            for (size_t i = 0; i <= path_len - plen; i++)
+                if (memcmp(path + i, pattern, plen) == 0) return true;
+            return false;
+        }
+        case VIRT_MATCH_GLOB: {
+            VIRT_GlobPattern gp;
+            return virt_glob_compile(pattern, &gp) == VIRT_OK && virt_glob_match(&gp, path, path_len);
+        }
+        case VIRT_MATCH_REGEX: {
+            if (plen > path_len) return false;
+            for (size_t i = 0; i <= path_len - plen; i++)
+                if (memcmp(path + i, pattern, plen) == 0) return true;
+            return false;
+        }
+        case VIRT_MATCH_ALWAYS: return true;
+        case VIRT_MATCH_NEVER: return false;
+        default: return false;
+    }
+}
+
+int virt_stats_init(VIRT_SyscallStats *stats) {
+    if (!stats) return VIRT_ERR_INVAL;
+    memset(stats, 0, sizeof(*stats));
+    stats->min_latency_ns = UINT64_MAX;
+    stats->last_reset_tp = virt_gettime_ns();
+    stats->window_seconds = 60;
+    stats->history_index = 0;
+    stats->history_count = 0;
+    stats->handler_lifespan_ns = 0;
+    return VIRT_OK;
+}
+
+int virt_stats_record(VIRT_SyscallStats *stats, int syscall, int action, uint64_t latency) {
+    if (!stats) return VIRT_ERR_INVAL;
+    stats->total_calls++;
+    stats->total_latency_ns += latency;
+    if (latency > stats->max_latency_ns) stats->max_latency_ns = latency;
+    if (latency < stats->min_latency_ns) stats->min_latency_ns = latency;
+    if (syscall >= 0 && syscall < 512) stats->per_syscall[syscall]++;
+    if (action >= 0 && action < VIRT_ACTION_COUNT) stats->per_action[action]++;
+    switch (action) {
+        case VIRT_ACTION_BLOCK_ENOENT...VIRT_ACTION_FAKE_STATUS: stats->blocked_calls++; break;
+        case VIRT_ACTION_ALLOW: stats->allowed_calls++; break;
+        case VIRT_ACTION_PASS_THROUGH: stats->continued_calls++; break;
+        default: break;
+    }
+    stats->avg_latency_ns = (double)stats->total_latency_ns / (double)VIRT_MAX(stats->total_calls, 1ULL);
+    uint64_t now = virt_gettime_ns();
+    double elapsed = (double)(now - stats->last_reset_tp) / 1e9;
+    stats->calls_per_sec = (double)stats->total_calls / VIRT_MAX(elapsed, 0.001);
+    stats->blocked_percent = stats->total_calls ? 100.0 * (double)stats->blocked_calls / (double)stats->total_calls : 0.0;
+    uint32_t idx = stats->history_index % VIRT_MAX_STATS_HISTORY;
+    stats->history[idx].timestamp = now;
+    stats->history[idx].calls = stats->total_calls;
+    stats->history[idx].blocked = stats->blocked_calls;
+    stats->history[idx].avg_latency = (uint64_t)stats->avg_latency_ns;
+    stats->history_index++;
+    if (stats->history_count < VIRT_MAX_STATS_HISTORY) stats->history_count++;
+    return VIRT_OK;
+}
+
+int virt_stats_snapshot(const VIRT_SyscallStats *stats, char *buf, size_t buf_size) {
+    if (!stats || !buf || !buf_size) return VIRT_ERR_INVAL;
+    uint64_t now = virt_gettime_ns();
+    double uptime = (double)(now - stats->last_reset_tp) / 1e9;
+    int off = 0;
+    off += snprintf(buf + off, buf_size - (size_t)off, "=== Virtualizer Stats v%s ===\n", VIRTUALIZER_VERSION);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Uptime:       %10.1f sec\n", uptime);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Total:        %10lu\n", (unsigned long)stats->total_calls);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Blocked:      %10lu (%5.1f%%)\n", (unsigned long)stats->blocked_calls, stats->blocked_percent);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Passthrough:  %10lu\n", (unsigned long)stats->continued_calls);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Allowed:      %10lu\n", (unsigned long)stats->allowed_calls);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Calls/sec:    %10.1f\n", stats->calls_per_sec);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Avg Lat:      %10.0f ns\n", stats->avg_latency_ns);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Max Lat:      %10lu ns\n", (unsigned long)stats->max_latency_ns);
+    off += snprintf(buf + off, buf_size - (size_t)off, "Min Lat:      %10lu ns\n", (unsigned long)stats->min_latency_ns);
+    off += snprintf(buf + off, buf_size - (size_t)off, "\nPer-Syscall:\n");
+    for (int i = 0; i < 512; i++)
+        if (stats->per_syscall[i] > 0)
+            off += snprintf(buf + off, buf_size - (size_t)off, "  %-16s %lu\n", virt_syscall_name(i), (unsigned long)stats->per_syscall[i]);
+    off += snprintf(buf + off, buf_size - (size_t)off, "\nPer-Action:\n");
+    for (int i = 0; i < VIRT_ACTION_COUNT; i++)
+        if (stats->per_action[i] > 0)
+            off += snprintf(buf + off, buf_size - (size_t)off, "  %-16s %lu\n", VIRT_ACTION_NAMES[i], (unsigned long)stats->per_action[i]);
+    return VIRT_MIN(off, (int)buf_size - 1);
+}
+
+int virt_cache_lookup(VIRT_CacheEntry *cache, uint32_t cache_count, const char *path, uint32_t path_len) {
+    if (!cache || !path || !path_len) return VIRT_ERR_INVAL;
+    uint64_t now = virt_gettime_ns();
+    for (uint32_t i = 0; i < cache_count; i++) {
+        if (!cache[i].valid) continue;
+        if (cache[i].path_len == path_len && memcmp(cache[i].path, path, path_len) == 0) {
+            cache[i].hit_count++;
+            if (now - cache[i].cached_at_ns > cache[i].ttl_ns) { cache[i].valid = false; return VIRT_ERR_NOENT; }
+            return cache[i].is_sensitive ? cache[i].action : VIRT_ACTION_PASS_THROUGH;
+        }
+    }
+    return VIRT_ERR_NOENT;
+}
+
+int virt_cache_insert(VIRT_CacheEntry *cache, uint32_t *cache_count, uint32_t cache_max, const char *path, uint32_t path_len, bool sensitive, int action) {
+    if (!cache || !cache_count || !path || !path_len) return VIRT_ERR_INVAL;
+    uint32_t idx;
+    if (*cache_count < cache_max) { idx = (*cache_count)++; }
+    else {
+        uint64_t oldest = UINT64_MAX; idx = 0;
+        for (uint32_t i = 0; i < cache_max; i++) {
+            if (!cache[i].valid) { idx = i; break; }
+            if (cache[i].cached_at_ns < oldest) { oldest = cache[i].cached_at_ns; idx = i; }
+        }
+    }
+    memset(&cache[idx], 0, sizeof(VIRT_CacheEntry));
+    uint32_t cp = VIRT_MIN(path_len, (uint32_t)VIRT_PATH_BUF_SIZE - 1);
+    memcpy(cache[idx].path, path, cp); cache[idx].path[cp] = '\0';
+    cache[idx].path_len = path_len; cache[idx].is_sensitive = sensitive;
+    cache[idx].action = action; cache[idx].cached_at_ns = virt_gettime_ns();
+    cache[idx].ttl_ns = VIRT_CACHE_TTL_NS; cache[idx].valid = true; cache[idx].hit_count = 0;
+    return VIRT_OK;
+}
+
+int virt_cache_invalidate(VIRT_CacheEntry *cache, uint32_t *cache_count, const char *path) {
+    if (!cache || !cache_count || !path) return VIRT_ERR_INVAL;
+    size_t plen = strlen(path); uint32_t removed = 0;
+    for (uint32_t i = 0; i < *cache_count; i++) {
+        if (cache[i].valid && cache[i].path_len == plen && memcmp(cache[i].path, path, plen) == 0) {
+            cache[i].valid = false; removed++;
+        }
+    }
+    return removed ? VIRT_OK : VIRT_ERR_NOENT;
+}
+
+int virt_rules_add(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules, const VIRT_Rule *rule) {
+    if (!rules || !rule_count || !rule) return VIRT_ERR_INVAL;
+    if (*rule_count >= max_rules) {
+        uint32_t lowest = UINT32_MAX, repl = UINT32_MAX;
+        for (uint32_t i = 0; i < *rule_count; i++)
+            if (rules[i].is_default && rules[i].priority < lowest) { lowest = rules[i].priority; repl = i; }
+        if (repl == UINT32_MAX) return VIRT_ERR_NOMEM;
+        rules[repl] = *rule; return VIRT_OK;
+    }
+    rules[*rule_count] = *rule; (*rule_count)++;
+    return VIRT_OK;
+}
+
+int virt_rules_remove(VIRT_Rule *rules, uint32_t *rule_count, uint32_t index) {
+    if (!rules || !rule_count || index >= *rule_count) return VIRT_ERR_INVAL;
+    if (rules[index].is_system) return VIRT_ERR_PERM;
+    for (uint32_t i = index; i < *rule_count - 1; i++) rules[i] = rules[i + 1];
+    (*rule_count)--; return VIRT_OK;
+}
+
+int virt_rules_lookup(const VIRT_Rule *rules, uint32_t rule_count, const char *path, uint32_t path_len, int *out_action) {
+    if (!rules || !path || !out_action) return VIRT_ERR_INVAL;
+    *out_action = VIRT_ACTION_PASS_THROUGH; int best = -1;
+    for (uint32_t i = 0; i < rule_count; i++) {
+        if (!rules[i].enabled) continue;
+        if (virt_path_match(path, path_len, rules[i].pattern, rules[i].match_type)) {
+            if ((int)rules[i].priority > best) { best = (int)rules[i].priority; *out_action = rules[i].action; }
+        }
+    }
+    return best >= 0 ? VIRT_OK : VIRT_ERR_NOENT;
+}
+
+static int virt_rule_cmp(const void *a, const void *b) {
+    const VIRT_Rule *ra = (const VIRT_Rule *)a, *rb = (const VIRT_Rule *)b;
+    if (ra->priority != rb->priority) return (int)rb->priority - (int)ra->priority;
+    return ra->is_system ? (rb->is_system ? 0 : 1) : (rb->is_system ? -1 : 0);
+}
+
+int virt_rules_sort(VIRT_Rule *rules, uint32_t rule_count) {
+    if (!rules || !rule_count) return VIRT_ERR_INVAL;
+    qsort(rules, rule_count, sizeof(VIRT_Rule), virt_rule_cmp);
+    return VIRT_OK;
+}
+
+int virt_rules_load_defaults(VIRT_Rule *rules, uint32_t *rule_count, uint32_t max_rules) {
+    if (!rules || !rule_count) return VIRT_ERR_INVAL;
+    *rule_count = 0;
+    for (size_t i = 0; VIRT_DEFAULT_BLOCKED_PATTERNS[i] != NULL && *rule_count < max_rules; i++) {
+        VIRT_Rule rule; memset(&rule, 0, sizeof(rule));
+        virt_safe_strncpy(rule.pattern, VIRT_DEFAULT_BLOCKED_PATTERNS[i], sizeof(rule.pattern));
+        rule.pattern_len = (uint32_t)strlen(VIRT_DEFAULT_BLOCKED_PATTERNS[i]);
+        rule.match_type = VIRT_MATCH_SUBSTRING; rule.action = VIRT_ACTION_BLOCK_ENOENT;
+        rule.scope = VIRT_SCOPE_ALL; rule.category = VIRT_CAT_PROC; rule.priority = 100;
+        rule.enabled = true; rule.is_default = true; rule.is_system = true;
+        rule.created_ns = virt_gettime_ns(); rule.hit_count = 0; rule.ref_count = 1;
+        if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/proc/")) rule.category = VIRT_CAT_PROC;
+        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/su") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/magisk") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/data/adb") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/sbin/")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 200; }
+        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "xposed") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "frida") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "substrate")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 300; }
+        rules[*rule_count] = rule; (*rule_count)++;
+    }
+    VIRT_LOGI("Loaded %u default rules", *rule_count);
+    return VIRT_OK;
+}
+
+int virt_proc_hider_init(VIRT_ProcHiderState *state) {
+    if (!state) return VIRT_ERR_INVAL;
+    memset(state, 0, sizeof(*state));
+    state->initialized = true;
+    state->hide_maps = true; state->hide_fd = true; state->hide_status = true;
+    state->hide_stat = true; state->hide_mountinfo = true; state->hide_cmdline = true;
+    state->hide_environ = true; state->hide_limits = true; state->hide_smaps = true;
+    state->hide_smaps_rollup = true; state->hide_numamaps = true; state->hide_oom = true;
+    state->hide_sched = true; state->hide_cgroup = true; state->hide_attr = true;
+    state->hide_task = true; state->fake_maps_content = true; state->fake_status_content = true;
+    state->fake_cmdline_content = true;
+    state->hidden_fd_count = 0; state->hidden_pid_count = 0; state->hidden_tid_count = 0;
+    virt_safe_strncpy(state->proc_name_fake, "app_process64", sizeof(state->proc_name_fake));
+    virt_safe_strncpy(state->cmdline_fake, "/system/bin/app_process64", sizeof(state->cmdline_fake));
+    virt_safe_strncpy(state->fake_status_fields.name, "app_process64", sizeof(state->fake_status_fields.name));
+    virt_safe_strncpy(state->fake_status_fields.state, "S (sleeping)", sizeof(state->fake_status_fields.state));
+    virt_safe_strncpy(state->fake_status_fields.ppid, "1", sizeof(state->fake_status_fields.ppid));
+    virt_safe_strncpy(state->fake_status_fields.uid, "10123", sizeof(state->fake_status_fields.uid));
+    virt_safe_strncpy(state->fake_status_fields.gid, "10123", sizeof(state->fake_status_fields.gid));
+    virt_safe_strncpy(state->fake_status_fields.tgid, "12345", sizeof(state->fake_status_fields.tgid));
+    virt_safe_strncpy(state->fake_status_fields.tracerpid, "0", sizeof(state->fake_status_fields.tracerpid));
+    virt_safe_strncpy(state->fake_status_fields.threads_str, "12", sizeof(state->fake_status_fields.threads_str));
+    return VIRT_OK;
+}
+
+int virt_proc_hider_add_fd(VIRT_ProcHiderState *state, int fd) {
+    if (!state || fd < 0) return VIRT_ERR_INVAL;
+    for (uint32_t i = 0; i < state->hidden_fd_count; i++) if (state->hidden_fds[i] == (uint32_t)fd) return VIRT_OK;
+    if (state->hidden_fd_count < ARRAY_COUNT(state->hidden_fds)) state->hidden_fds[state->hidden_fd_count++] = (uint32_t)fd;
+    return VIRT_OK;
+}
+
+int virt_proc_hider_remove_fd(VIRT_ProcHiderState *state, int fd) {
+    if (!state || fd < 0) return VIRT_ERR_INVAL;
+    for (uint32_t i = 0; i < state->hidden_fd_count; i++) {
+        if (state->hidden_fds[i] == (uint32_t)fd) {
+            for (uint32_t j = i; j < state->hidden_fd_count - 1; j++) state->hidden_fds[j] = state->hidden_fds[j + 1];
+            state->hidden_fd_count--; return VIRT_OK;
+        }
+    }
+    return VIRT_ERR_NOENT;
+}
+
+int virt_proc_hider_add_pid(VIRT_ProcHiderState *state, pid_t pid) {
+    if (!state || pid < 0) return VIRT_ERR_INVAL;
+    for (uint32_t i = 0; i < state->hidden_pid_count; i++) if (state->hidden_pids[i] == (uint32_t)pid) return VIRT_OK;
+    if (state->hidden_pid_count < ARRAY_COUNT(state->hidden_pids)) state->hidden_pids[state->hidden_pid_count++] = (uint32_t)pid;
+    return VIRT_OK;
+}
+
+int virt_proc_hider_check_fd_path(VIRT_ProcHiderState *state,
+                                   const char *path, uint32_t path_len) {
+    if (!state || !path || !path_len) return 0;
+    /* Check if path matches /proc/self/fd/<hidden_fd> or
+     * /proc/<pid>/fd/<hidden_fd> */
+    const char *fdmark = strstr(path, "/fd/");
+    if (!fdmark) return 0;
+    const char *fdnum = fdmark + 4;
+    for (uint32_t i = 0; i < state->hidden_fd_count; i++) {
+        char fdbuf[16];
+        int n = snprintf(fdbuf, sizeof(fdbuf), "%u", state->hidden_fds[i]);
+        size_t remaining = path_len - (size_t)(fdnum - path);
+        if ((size_t)n <= remaining &&
+            memcmp(fdnum, fdbuf, (size_t)n) == 0 &&
+            (fdnum[n] == '\0' || fdnum[n] == '/' || fdnum[n] == '\n')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int virt_proc_hider_filter_dirents(VIRT_ProcHiderState *state,
+                                    const char *dirents, uint32_t dirents_len,
+                                    char *out, uint32_t *out_len) {
+    if (!state || !dirents || !out || !out_len) return VIRT_ERR_INVAL;
+    *out_len = 0;
+    uint32_t pos = 0;
+    while (pos < dirents_len) {
+        struct linux_dirent64 *ent = (struct linux_dirent64 *)(dirents + pos);
+        if (ent->d_reclen == 0) break;
+        bool skip = false;
+        for (uint32_t i = 0; i < state->hidden_fd_count; i++) {
+            char fdbuf[16];
+            int n = snprintf(fdbuf, sizeof(fdbuf), "%u", state->hidden_fds[i]);
+            if ((size_t)n == strlen(ent->d_name) &&
+                memcmp(ent->d_name, fdbuf, (size_t)n) == 0) {
+                skip = true;
+                break;
+            }
+        }
+        if (!skip) {
+            if (*out_len + ent->d_reclen > dirents_len) break;
+            memcpy(out + *out_len, ent, ent->d_reclen);
+            *out_len += ent->d_reclen;
+        }
+        pos += ent->d_reclen;
+    }
+    return VIRT_OK;
+}
+
+int virt_anti_tamper_init(VIRT_AntiTamperState *state) {
+    if (!state) return VIRT_ERR_INVAL;
+    memset(state, 0, sizeof(*state));
+    state->initialized = true; state->integrity_ok = true;
+    state->check_interval_ns = VIRT_ANTI_TAMPER_INTERVAL_NS;
+    state->last_check_ns = virt_gettime_ns();
+    state->total_checks = 0; state->total_alerts = 0;
+    state->integrity_failures = 0; state->detected_hooks = 0;
+    state->detected_debuggers = 0; state->detected_ptrace = 0;
+    Dl_info info;
+    if (dladdr((void *)virt_anti_tamper_init, &info)) {
+        state->module_base = (uintptr_t)info.dli_fbase;
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[512];
+            while (fgets(line, sizeof(line), maps)) {
+                uintptr_t start, end; char perm[8];
+                if (sscanf(line, "%lx-%lx %4s", &start, &end, perm) >= 3) {
+                    if (start <= state->module_base && state->module_base < end) {
+                        state->module_size = end - start; break;
+                    }
+                }
+            }
+            fclose(maps);
+        }
+        int fd = open(info.dli_fname, O_RDONLY);
+        if (fd >= 0) {
+            char hdr[8192]; ssize_t n = read(fd, hdr, sizeof(hdr));
+            if (n > 0) state->expected_text_hash = virt_hash_fnv1a(hdr, (size_t)n);
+            close(fd);
+        }
+    }
+    return VIRT_OK;
+}
+
+int virt_anti_tamper_check(VIRT_AntiTamperState *state) {
+    if (!state || !state->initialized) return VIRT_ERR_INVAL;
+    uint64_t now = virt_gettime_ns();
+    if (now - state->last_check_ns < state->check_interval_ns) return VIRT_OK;
+    state->last_check_ns = now; state->total_checks++;
+    int dbg = virt_anti_tamper_detect_debugger();
+    int pt = virt_anti_tamper_detect_ptrace();
+    int hk = virt_anti_tamper_detect_hook();
+    if (dbg > 0) { state->detected_debuggers++; state->integrity_failures++; }
+    if (pt > 0) { state->detected_ptrace++; state->integrity_failures++; }
+    if (hk > 0) { state->detected_hooks += (uint32_t)hk; state->integrity_failures++; }
+    if (dbg > 0 || pt > 0 || hk > 0) {
+        state->integrity_ok = false; state->total_alerts++;
+        VIRT_LOGW("Anti-tamper alert: dbg=%d pt=%d hook=%d (alerts=%u)", dbg, pt, hk, state->total_alerts);
+        return VIRT_ERR_PERM;
+    }
+    virt_anti_tamper_check_memory(state);
+    virt_anti_tamper_check_code(state);
+    state->last_check_result = state->integrity_ok ? VIRT_OK : VIRT_ERR_CORRUPT;
+    return state->last_check_result;
+}
+
+int virt_anti_tamper_detect_debugger(void) {
+    char buf[256];
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    const char *tp = strstr(buf, "TracerPid:");
+    if (!tp) return -1;
+    tp += 10;
+    while (*tp == ' ' || *tp == '\t') tp++;
+    return (*tp != '0') ? 1 : 0;
+}
+
+int virt_anti_tamper_detect_ptrace(void) {
+    /* ptrace not available on stock Android kernels. Check via /proc.
+     * If PTRACE_TRACEME isn't defined, just check TracerPid. */
+#ifndef PTRACE_TRACEME
+    return virt_anti_tamper_detect_debugger();
+#else
+    int ret = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+    if (ret == 0) { ptrace(PTRACE_DETACH, 0, NULL, NULL); return 0; }
+    return (errno == EPERM) ? 1 : 0;
+#endif
+}
+
+/* Helper to get function addresses for hook detection */
+static void *_virt_fn(const char *name) {
+    void *h = dlopen("libc.so", RTLD_NOLOAD | RTLD_LAZY);
+    if (!h) return NULL;
+    void *sym = dlsym(h, name);
+    dlclose(h);
+    return sym;
+}
+
+int virt_anti_tamper_detect_hook(void) {
+    void *libc = dlopen("libc.so", RTLD_NOLOAD);
+    if (!libc) return 0;
+    const char *check_names[] = {
+        "open", "read", "write", "close", "fstat", "mmap",
+        "mprotect", "dlopen", "dlsym", "ioctl", "openat",
+        "prctl", "connect",
+    };
+    int hooks = 0;
+    for (size_t i = 0; i < ARRAY_COUNT(check_names); i++) {
+        void *lib_sym = dlsym(libc, check_names[i]);
+        void *real_sym = _virt_fn(check_names[i]);
+        if (lib_sym && real_sym && lib_sym != real_sym) hooks++;
+    }
+    dlclose(libc);
+    return hooks;
+}
+
+int virt_config_load(const char *path, VIRT_Config *cfg) {
+    if (!path || !cfg) return VIRT_ERR_INVAL;
+    *cfg = VIRT_DEFAULT_CONFIG;
+    FILE *f = fopen(path, "r");
+    if (!f) return VIRT_OK;
+    char line[1024]; int ln = 0;
+    while (fgets(line, sizeof(line), f)) {
+        ln++; char *p = line; while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char *eq = strchr(p, '='); if (!eq) continue;
+        *eq = '\0'; char *key = p; char *val = eq + 1;
+        while (*key == ' ' || *key == '\t') key++;
+        char *ke = key + strlen(key) - 1; while (ke > key && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
+        while (*val == ' ' || *val == '\t') val++;
+        char *ve = val + strlen(val) - 1; while (ve > val && (*ve == ' ' || *ve == '\t' || *ve == '\n' || *ve == '\r')) *ve-- = '\0';
+        auto set_bool = [&](bool *f) { *f = atoi(val) != 0; };
+        auto set_u32 = [&](uint32_t *f) { *f = (uint32_t)atol(val); };
+        if (!strcmp(key, "log_level")) cfg->log_level = atoi(val);
+        else if (!strcmp(key, "filter_mode")) cfg->filter_mode = atoi(val);
+        else if (!strcmp(key, "default_action")) cfg->default_action = atoi(val);
+        else if (!strcmp(key, "cache_size")) set_u32(&cfg->cache_size);
+        else if (!strcmp(key, "stats_window_sec")) set_u32(&cfg->stats_window_sec);
+        else if (!strcmp(key, "watchdog_interval_sec")) set_u32(&cfg->watchdog_interval_sec);
+        else if (!strcmp(key, "handler_stack_size")) set_u32(&cfg->handler_stack_size);
+        else if (!strcmp(key, "notif_timeout_ms")) set_u32(&cfg->notif_timeout_ms);
+        else if (!strcmp(key, "max_rules")) set_u32(&cfg->max_rules);
+        else if (!strcmp(key, "max_consecutive_errors")) set_u32(&cfg->max_consecutive_errors);
+        else if (!strcmp(key, "timing_jitter_us")) set_u32(&cfg->timing_jitter_us);
+        else if (!strcmp(key, "enable_stats")) set_bool(&cfg->enable_stats);
+        else if (!strcmp(key, "enable_cache")) set_bool(&cfg->enable_cache);
+        else if (!strcmp(key, "enable_watchdog")) set_bool(&cfg->enable_watchdog);
+        else if (!strcmp(key, "enable_anti_tamper")) set_bool(&cfg->enable_anti_tamper);
+        else if (!strcmp(key, "enable_proc_hiding")) set_bool(&cfg->enable_proc_hiding);
+        else if (!strcmp(key, "enable_fake_content")) set_bool(&cfg->enable_fake_content);
+        else if (!strcmp(key, "enable_timing_jitter")) set_bool(&cfg->enable_timing_jitter);
+        else if (!strcmp(key, "enable_thread_sync")) set_bool(&cfg->enable_thread_sync);
+        else if (!strcmp(key, "enable_kernel_compat")) set_bool(&cfg->enable_kernel_compat);
+        else if (!strcmp(key, "enable_self_diagnostics")) set_bool(&cfg->enable_self_diagnostics);
+        else if (!strcmp(key, "enable_trie_index")) set_bool(&cfg->enable_trie_index);
+        else if (!strcmp(key, "enable_event_ring")) set_bool(&cfg->enable_event_ring);
+        else if (!strcmp(key, "enable_latency_tracking")) set_bool(&cfg->enable_latency_tracking);
+        else if (!strcmp(key, "enable_periodic_reporting")) set_bool(&cfg->enable_periodic_reporting);
+        else if (!strcmp(key, "config_path")) virt_safe_strncpy(cfg->config_path, val, sizeof(cfg->config_path));
+        else if (!strcmp(key, "rules_path")) virt_safe_strncpy(cfg->rules_path, val, sizeof(cfg->rules_path));
+        else if (!strcmp(key, "log_tag")) virt_safe_strncpy(cfg->log_tag, val, sizeof(cfg->log_tag));
+    }
+    fclose(f);
+    return VIRT_OK;
+}
+
+int virt_config_validate(const VIRT_Config *cfg) {
+    if (!cfg) return VIRT_ERR_INVAL;
+    if (cfg->log_level < VIRT_LOG_LEVEL_NONE || cfg->log_level > VIRT_LOG_LEVEL_TRACE) return VIRT_ERR_INVAL;
+    if (cfg->filter_mode < 0 || cfg->filter_mode >= VIRT_FILTER_MODE_COUNT) return VIRT_ERR_INVAL;
+    if (cfg->default_action < 0 || cfg->default_action >= VIRT_ACTION_COUNT) return VIRT_ERR_INVAL;
+    if (cfg->max_rules == 0 || cfg->max_rules > 65536) return VIRT_ERR_INVAL;
+    if (cfg->cache_size == 0 || cfg->cache_size > 65536) return VIRT_ERR_INVAL;
+    if (cfg->handler_stack_size < 65536 || cfg->handler_stack_size > 8388608) return VIRT_ERR_INVAL;
+    return VIRT_OK;
+}
+
+int virt_config_generate_default(const char *path) {
+    if (!path) return VIRT_ERR_INVAL;
+    FILE *f = fopen(path, "w");
+    if (!f) return VIRT_ERR_GENERIC;
+    fprintf(f, "# Universal Syscall Virtualization Framework v%s\n", VIRTUALIZER_VERSION);
+    fprintf(f, "# Auto-generated default configuration\n\n");
+    fprintf(f, "# Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace\n");
+    fprintf(f, "log_level=%d\n\n", VIRT_LOG_LEVEL_INFO);
+    fprintf(f, "# Filter mode: 0=static BPF, 1=dynamic BPF\n");
+    fprintf(f, "filter_mode=%d\n\n", VIRT_FILTER_MODE_BPF_STATIC);
+    fprintf(f, "# Default action for unmatched paths\n");
+    fprintf(f, "# 0=allow, 1=block-enoent, 12=pass-through\n");
+    fprintf(f, "default_action=%d\n\n", VIRT_ACTION_PASS_THROUGH);
+    fprintf(f, "cache_size=%u\n", VIRT_MAX_CACHED_PATHS);
+    fprintf(f, "stats_window_sec=%u\n", 60);
+    fprintf(f, "watchdog_interval_sec=%u\n", 5);
+    fprintf(f, "handler_stack_size=%u\n", VIRT_HANDLER_STACK_SIZE);
+    fprintf(f, "notif_timeout_ms=%u\n", VIRT_NOTIF_FD_TIMEOUT_MS);
+    fprintf(f, "max_consecutive_errors=%u\n", 10);
+    fprintf(f, "enable_stats=1\n");
+    fprintf(f, "enable_cache=1\n");
+    fprintf(f, "enable_watchdog=1\n");
+    fprintf(f, "enable_anti_tamper=1\n");
+    fprintf(f, "enable_proc_hiding=1\n");
+    fprintf(f, "enable_fake_content=1\n");
+    fprintf(f, "enable_thread_sync=1\n");
+    fprintf(f, "enable_kernel_compat=1\n");
+    fprintf(f, "enable_self_diagnostics=1\n");
+    fprintf(f, "enable_trie_index=1\n");
+    fprintf(f, "enable_event_ring=1\n");
+    fclose(f);
+    return VIRT_OK;
+}
+
+int virt_thread_monitor_init(void) {
+    pthread_mutex_lock(&g_thread_monitor_lock);
+    memset(g_thread_monitors, 0, sizeof(g_thread_monitors));
+    g_thread_monitor_count = 0;
+    pthread_mutex_unlock(&g_thread_monitor_lock);
+    return VIRT_OK;
+}
+
+int virt_thread_monitor_register(pid_t tid, const char *name) {
+    if (tid < 0) return VIRT_ERR_INVAL;
+    pthread_mutex_lock(&g_thread_monitor_lock);
+    for (uint32_t i = 0; i < g_thread_monitor_count; i++) {
+        if (g_thread_monitors[i].tid == tid) {
+            g_thread_monitors[i].last_seen_ns = virt_gettime_ns();
+            g_thread_monitors[i].is_alive = true;
+            if (name) virt_safe_strncpy(g_thread_monitors[i].name, name, 64);
+            pthread_mutex_unlock(&g_thread_monitor_lock);
+            return VIRT_OK;
+        }
+    }
+    if (g_thread_monitor_count >= ARRAY_COUNT(g_thread_monitors)) {
+        uint32_t oldest = 0;
+        for (uint32_t i = 1; i < g_thread_monitor_count; i++)
+            if (g_thread_monitors[i].last_seen_ns < g_thread_monitors[oldest].last_seen_ns) oldest = i;
+        memset(&g_thread_monitors[oldest], 0, sizeof(VIRT_ThreadMonitor));
+        g_thread_monitors[oldest].tid = tid;
+        g_thread_monitors[oldest].created_ns = virt_gettime_ns();
+        g_thread_monitors[oldest].last_seen_ns = virt_gettime_ns();
+        g_thread_monitors[oldest].is_alive = true;
+        if (name) virt_safe_strncpy(g_thread_monitors[oldest].name, name, 64);
+        pthread_mutex_unlock(&g_thread_monitor_lock);
+        return VIRT_OK;
+    }
+    uint32_t idx = g_thread_monitor_count++;
+    memset(&g_thread_monitors[idx], 0, sizeof(VIRT_ThreadMonitor));
+    g_thread_monitors[idx].tid = tid;
+    g_thread_monitors[idx].created_ns = virt_gettime_ns();
+    g_thread_monitors[idx].last_seen_ns = virt_gettime_ns();
+    g_thread_monitors[idx].is_alive = true;
+    if (name) virt_safe_strncpy(g_thread_monitors[idx].name, name, 64);
+    pthread_mutex_unlock(&g_thread_monitor_lock);
+    return VIRT_OK;
+}
+
+int virt_thread_monitor_update(pid_t tid, bool has_seccomp) {
+    pthread_mutex_lock(&g_thread_monitor_lock);
+    for (uint32_t i = 0; i < g_thread_monitor_count; i++) {
+        if (g_thread_monitors[i].tid == tid) {
+            g_thread_monitors[i].last_seen_ns = virt_gettime_ns();
+            g_thread_monitors[i].has_seccomp = has_seccomp;
+            g_thread_monitors[i].syscall_count++;
+            pthread_mutex_unlock(&g_thread_monitor_lock);
+            return VIRT_OK;
+        }
+    }
+    pthread_mutex_unlock(&g_thread_monitor_lock);
+    return virt_thread_monitor_register(tid, NULL);
+}
+
+int virt_thread_monitor_get_count(void) {
+    pthread_mutex_lock(&g_thread_monitor_lock);
+    int count = (int)g_thread_monitor_count;
+    pthread_mutex_unlock(&g_thread_monitor_lock);
+    return count;
+}
+
+int virt_thread_monitor_get_info(int index, VIRT_ThreadMonitor *out) {
+    if (!out) return VIRT_ERR_INVAL;
+    pthread_mutex_lock(&g_thread_monitor_lock);
+    if (index < 0 || index >= (int)g_thread_monitor_count) { pthread_mutex_unlock(&g_thread_monitor_lock); return VIRT_ERR_NOENT; }
+    *out = g_thread_monitors[index];
+    pthread_mutex_unlock(&g_thread_monitor_lock);
+    return VIRT_OK;
+}
+
+void virt_print_hexdump(const void *data, size_t len, const char *label) {
+    if (!data || !label) return;
+    const unsigned char *d = (const unsigned char *)data;
+    char line[128]; int off = 0;
+    off += snprintf(line + off, sizeof(line) - (size_t)off, "%s (%zu bytes): ", label, len);
+    for (size_t i = 0; i < VIRT_MIN(len, 64); i++)
+        off += snprintf(line + off, sizeof(line) - (size_t)off, "%02x ", d[i]);
+    VIRT_LOGD("%s", line);
+}
+
+int virt_safe_strncpy(char *dst, const char *src, size_t dst_size) {
+    if (!dst || !src || !dst_size) return VIRT_ERR_INVAL;
+    size_t slen = strlen(src);
+    size_t copy = VIRT_MIN(slen, dst_size - 1);
+    memcpy(dst, src, copy);
+    dst[copy] = '\0';
+    return VIRT_OK;
+}
+
+int virt_safe_strcat(char *dst, const char *src, size_t dst_size) {
+    if (!dst || !src || !dst_size) return VIRT_ERR_INVAL;
+    size_t dlen = strlen(dst), slen = strlen(src);
+    if (dlen + slen >= dst_size) return VIRT_ERR_NOMEM;
+    memcpy(dst + dlen, src, slen);
+    dst[dlen + slen] = '\0';
+    return VIRT_OK;
+}
+
+/* --- Shadow Library Mirror Subsystem ---
+ * Hosts a pristine copy of the target library in anonymous memory.
+ * Anti-cheat memory inspection that queries the execution_base region
+ * will read from this untouched mirror instead of the patched original. */
+
+static ShadowLibraryMirror g_shadow_library;
+
+static int virt_find_library_maps(const char *lib_name,
+                                   uintptr_t *out_start,
+                                   uintptr_t *out_end,
+                                   char *out_path, size_t path_size) {
+    FILE *maps = fopen("/proc/self/maps", "re");
+    if (!maps) return VIRT_ERR_NOENT;
+
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        if (!strstr(line, lib_name)) continue;
+        uintptr_t start, end;
+        char path[256] = {0};
+        if (sscanf(line, "%lx-%lx %*s %*x %*s %*u %255s",
+                   &start, &end, path) >= 3) {
+            *out_start = start;
+            *out_end = end;
+            virt_safe_strncpy(out_path, path, path_size);
+            fclose(maps);
+            return VIRT_OK;
+        }
+    }
+    fclose(maps);
+    return VIRT_ERR_NOENT;
+}
+
+int virt_init_shadow_library(const char *lib_name) {
+    if (!lib_name) return VIRT_ERR_INVAL;
+    if (g_shadow_library.initialized) return VIRT_OK;
+
+    uintptr_t lib_start = 0, lib_end = 0;
+    char lib_path[256] = {0};
+
+    int rc = virt_find_library_maps(lib_name, &lib_start, &lib_end,
+                                     lib_path, sizeof(lib_path));
+    if (rc < 0) {
+        VIRT_LOGW("Shadow mirror: %s not mapped (rc=%d)", lib_name, rc);
+        return rc;
+    }
+    size_t lib_size = lib_end - lib_start;
+    if (lib_size == 0) return VIRT_ERR_NOENT;
+
+    VIRT_LOGI("Shadow mirror: found %s [%lx-%lx] (%zu bytes) file=%s",
+              lib_name, lib_start, lib_end, lib_size, lib_path);
+
+    void *mirror = mmap(NULL, lib_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mirror == MAP_FAILED) {
+        VIRT_LOGE("Shadow mirror: mmap(%zu) failed: %s",
+                  lib_size, strerror(errno));
+        return VIRT_ERR_NOMEM;
+    }
+
+    int fd = open(lib_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        VIRT_LOGE("Shadow mirror: open %s failed: %s",
+                  lib_path, strerror(errno));
+        munmap(mirror, lib_size);
+        return VIRT_ERR_GENERIC;
+    }
+
+    ssize_t total = 0;
+    while (total < (ssize_t)lib_size) {
+        ssize_t n = read(fd, (char *)mirror + total,
+                          lib_size - (size_t)total);
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fd);
+
+    if (total < (ssize_t)lib_size) {
+        VIRT_LOGW("Shadow mirror: short read %zd < %zu", total, lib_size);
+    }
+
+    mlock(mirror, lib_size);
+
+    g_shadow_library.execution_base = lib_start;
+    g_shadow_library.pristine_base  = (uintptr_t)mirror;
+    g_shadow_library.segment_size   = lib_size;
+    g_shadow_library.initialized    = true;
+
+    VIRT_LOGI("Shadow mirror: active %zu bytes at %lx -> %lx",
+              lib_size, lib_start, (uintptr_t)mirror);
+    return VIRT_OK;
+}
+
+const ShadowLibraryMirror *virt_get_shadow_mirror(void) {
+    return &g_shadow_library;
+}
