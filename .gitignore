@@ -6,3 +6,4 @@ zygisk-virtualizer/
 *.iml
 .idea/
 .DS_Store
+AGENTS.md
