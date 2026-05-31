@@ -71,6 +71,7 @@
 #include <type_traits>
 #include <utility>
 #include <algorithm>
+#include <sys/un.h>
 #include <sys/utsname.h>
 
 #define VIRT_LOG_TAG "Virtualizer"
@@ -148,7 +149,7 @@
 #define VIRT_HEALTH_REPORT_INTERVAL 5000
 #define VIRT_STATS_REPORT_INTERVAL  5000
 #define VIRT_EVENT_RING_SIZE    1024
-#define VIRT_LATENCY_BUCKETS   10
+#define VIRT_LATENCY_BUCKETS   8
 #define VIRT_STATS_TOP_SYSCALLS 10
 #define VIRT_MAX_FAKE_FILES     64
 #define VIRT_MAX_CONNECT_RULES  64
@@ -158,6 +159,9 @@
 #define VIRT_MAX_DEPENDENCY_CHAIN 16
 #define VIRT_SIGNAL_STACK_SIZE  (32 * 1024)
 #define VIRT_UPTIME_BASE_SECONDS 86400ULL
+
+#define VIRT_MEM_PRESSURE_THRESHOLD (10 * 1024 * 1024)
+#define VIRT_MEM_CRITICAL_THRESHOLD (20 * 1024 * 1024)
 
 #ifndef AUDIT_ARCH_AARCH64
 #define AUDIT_ARCH_AARCH64 (EM_AARCH64 | 0x40000000)
@@ -391,6 +395,10 @@
 
 #ifndef __NR_unlinkat
 #define __NR_unlinkat 35
+#endif
+
+#ifndef __NR_renameat2
+#define __NR_renameat2 276
 #endif
 
 #ifndef __NR_renameat
@@ -705,6 +713,8 @@ enum VIRT_SYSCALL_NR : int {
     VIRT_NR_getpid          = 172,
     VIRT_NR_gettid          = 178,
     VIRT_NR_exit            = 93,
+    VIRT_NR_unlinkat        = 35,
+    VIRT_NR_renameat2       = 276,
 };
 
 enum VIRT_MATCH_TYPE : int {
@@ -733,7 +743,8 @@ enum VIRT_ACTION : int {
     VIRT_ACTION_FAKE_MAPS        = 10,
     VIRT_ACTION_FAKE_STATUS      = 11,
     VIRT_ACTION_PASS_THROUGH     = 12,
-    VIRT_ACTION_COUNT            = 13
+    VIRT_ACTION_MONITOR          = 13,
+    VIRT_ACTION_COUNT            = 14
 };
 
 enum VIRT_SCOPE : int {
@@ -919,6 +930,10 @@ typedef struct VIRT_Config {
     bool enable_per_syscall_stats;
     bool enable_periodic_reporting;
     bool enable_signal_safety;
+    bool enable_openat_intercept;
+    bool enable_readlinkat_intercept;
+    bool enable_connect_intercept;
+    bool enable_mmap_intercept;
     uint32_t cache_size;
     uint32_t stats_window_sec;
     uint32_t watchdog_interval_sec;
@@ -1006,6 +1021,15 @@ typedef struct VIRT_HealthStatus {
     uint64_t total_events;
     uint64_t total_blocked;
 } VIRT_HealthStatus;
+
+typedef struct {
+    uint32_t max_cache_entries;
+    uint32_t max_rules;
+    uint32_t max_trie_nodes;
+    uint32_t max_event_history;
+    size_t   max_log_size;
+    bool     enable_strict_mode;
+} VIRT_ResourceLimits;
 
 typedef struct ShadowLibraryMirror {
     uintptr_t execution_base;
@@ -1261,6 +1285,8 @@ static const VIRT_SeccompFilterProfile DEFAULT_FILTER_PROFILES[] = {
     { __NR_ioctl,         VIRT_CAT_DEBUG,      false, "ioctl"         },
     { __NR_prctl,         VIRT_CAT_DEBUG,      true,  "prctl"         },
     { __NR_uname,         VIRT_CAT_OTHER,      true,  "uname"         },
+    { __NR_unlinkat,      VIRT_CAT_FILE_WRITE, true,  "unlinkat"      },
+    { __NR_renameat2,     VIRT_CAT_FILE_WRITE, true,  "renameat2"     },
     { -1,                 VIRT_CAT_OTHER,      false, "terminator"    },
 };
 
@@ -1293,7 +1319,8 @@ static const char *VIRT_ACTION_NAMES[VIRT_ACTION_COUNT] = {
     "allow", "block-enoent", "block-eacces", "block-eperm",
     "block-enxio", "block-eio", "block-erofs",
     "redirect", "fake-content", "fake-empty",
-    "fake-maps", "fake-status", "pass-through"
+    "fake-maps", "fake-status", "pass-through",
+    "monitor"
 };
 
 static const char *VIRT_HANDLER_STATE_NAMES[VIRT_HANDLER_STATE_COUNT] = {
@@ -1334,6 +1361,10 @@ static const VIRT_Config VIRT_DEFAULT_CONFIG = {
     .enable_per_syscall_stats = true,
     .enable_periodic_reporting = true,
     .enable_signal_safety     = true,
+    .enable_openat_intercept  = true,
+    .enable_readlinkat_intercept = true,
+    .enable_connect_intercept = true,
+    .enable_mmap_intercept    = true,
     .cache_size               = VIRT_MAX_CACHED_PATHS,
     .stats_window_sec         = 60,
     .watchdog_interval_sec    = 5,
@@ -1484,6 +1515,18 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "/proc/self/loginuid",
     "/proc/self/latency",
     "/proc/self/auxv",
+    "/proc/version",
+    "/proc/cpuinfo",
+    "/proc/sys/kernel/random/boot_id",
+    "/proc/sys/kernel/hostname",
+    "/proc/sys/kernel/osrelease",
+    "/proc/sys/kernel/ostype",
+    /* /proc/net/ paths — monitored, not blocked */
+    "/proc/net/tcp",
+    "/proc/net/tcp6",
+    "/proc/net/udp",
+    "/proc/net/unix",
+    "/proc/net/route",
     NULL,
 };
 
@@ -1656,6 +1699,11 @@ static inline uint64_t virt_gettime_realtime_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+// Latency histogram and benchmarking
+void virt_latency_record(const char *name, uint64_t latency_ns);
+void virt_latency_dump(void);
+int virt_benchmark_run(int iterations);
+
 static inline bool virt_is_syscall_intercepted(int nr) {
     switch (nr) {
         case __NR_openat:
@@ -1671,6 +1719,8 @@ static inline bool virt_is_syscall_intercepted(int nr) {
         case __NR_mprotect:
         case __NR_connect:
         case __NR_uname:
+        case __NR_unlinkat:
+        case __NR_renameat2:
             return true;
         default:
             return false;
@@ -1715,6 +1765,8 @@ static inline const char *virt_syscall_name(int nr) {
         case __NR_fcntl:      return "fcntl";
         case __NR_dup3:       return "dup3";
         case __NR_uname:      return "uname";
+        case __NR_unlinkat:   return "unlinkat";
+        case __NR_renameat2:  return "renameat2";
         default:              return "unknown";
     }
 }
@@ -1854,6 +1906,13 @@ int virt_seccomp_install_static(VIRT_Config *cfg,
                                  VIRT_SeccompFilterProfile *profiles,
                                  int profile_count);
 int virt_seccomp_install_static_default(VIRT_Config *cfg);
+int virt_seccomp_reload_filter(int new_filter_fd);
+int virt_seccomp_enable_syscall(int nr);
+int virt_seccomp_disable_syscall(int nr);
+bool virt_seccomp_is_syscall_enabled(int nr);
+int virt_seccomp_compile_and_install(VIRT_Config *cfg,
+                                     VIRT_SeccompFilterProfile *profiles,
+                                     int profile_count);
 int virt_seccomp_create_decoy_files(void);
 bool virt_decoy_file_create(const char *path, const char *const *lines);
 extern const char *VIRT_DECOY_MAPS_PATH;
@@ -1863,6 +1922,12 @@ extern const char *VIRT_DECOY_ENVIRON_PATH;
 extern const char *VIRT_DECOY_UPTIME_PATH;
 extern const char *VIRT_DECOY_STAT_PATH;
 extern const char *VIRT_DECOY_SELINUX_PATH;
+extern const char *VIRT_DECOY_VERSION_PATH;
+extern const char *VIRT_DECOY_BOOTID_PATH;
+extern const char *VIRT_DECOY_HOSTNAME_PATH;
+extern const char *VIRT_DECOY_OSRELEASE_PATH;
+extern const char *VIRT_DECOY_OSTYPE_PATH;
+extern const char *VIRT_DECOY_CPUINFO_PATH;
 int virt_seccomp_read_path(struct seccomp_notif *req,
                              char *buf, size_t buf_size,
                              uint64_t path_addr);
@@ -1915,6 +1980,12 @@ int virt_init_default_connect_rules(void);
 int virt_detect_environment(void);
 int virt_check_environment_support(void);
 
+typedef struct {
+    int fd;
+    char name[64];
+} VIRT_SocketInfo;
+
+int virt_scan_sockets(VIRT_SocketInfo *sockets, int max_sockets);
 int virt_anti_tamper_loop(void *arg);
 int virt_spoof_uname(struct utsname *uts);
 void virt_set_uptime_base(uint64_t seconds);
@@ -1932,5 +2003,20 @@ int virt_mask_environ(char *buffer, uint32_t buffer_size);
 
 int virt_spoof_selinux_context(pid_t target_pid);
 int virt_is_selinux_enforcing(void);
+
+int virt_get_fake_proc_version(char *buf, size_t buf_size);
+int virt_get_fake_boot_id(char *buf, size_t buf_size);
+int virt_get_fake_cpuinfo(char *buf, size_t buf_size);
+
+void virt_mem_track_alloc(size_t size);
+void virt_mem_track_free(size_t size);
+void virt_mem_record_oom(void);
+size_t virt_mem_get_usage(void);
+size_t virt_mem_get_peak(void);
+int virt_mem_check_pressure(void);
+void virt_mem_reduce_footprint(void);
+
+int virt_resource_limits_init(VIRT_ResourceLimits *limits);
+int virt_resource_check_limit(uint32_t current, uint32_t max, const char *name);
 
 #endif /* VIRTUALIZER_H */

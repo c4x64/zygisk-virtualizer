@@ -4,6 +4,16 @@
 extern int virt_decoy_load_from_file(const char *filepath, char *out_buf, size_t buf_size);
 extern int virt_decoy_init(VIRT_Config *cfg);
 
+static int g_current_filter_fd = -1;
+
+typedef struct {
+    int  syscall_nr;
+    bool enabled;
+} VIRT_SyscallToggle;
+
+static VIRT_SyscallToggle g_syscall_toggles[64];
+static int g_syscall_toggle_count = 0;
+
 static uint64_t g_seccomp_engine_events = 0;
 static uint64_t g_seccomp_engine_errors = 0;
 static uint64_t g_seccomp_engine_continue_fallback = 0;
@@ -21,41 +31,155 @@ static uint32_t g_seccomp_engine_active_listeners = 0;
 static uint32_t g_seccomp_engine_total_listeners = 0;
 static VIRT_ProcHiderState *g_seccomp_engine_proc_hider = NULL;
 
-/* Latency histogram */
-static const uint64_t g_latency_bucket_ns[VIRT_LATENCY_BUCKETS] = {
-    1000, 5000, 10000, 50000, 100000, 500000,
-    1000000, 5000000, 10000000, UINT64_MAX
-};
-static uint64_t g_latency_histogram[VIRT_LATENCY_BUCKETS] = {0};
+/* --- Timing Attack Detection --- */
+typedef struct {
+    struct timespec last_monitored;
+    uint64_t operation_count;
+    uint64_t timing_violations;
+    uint64_t total_processing_ns;
+} VIRT_TimingStats;
 
-static volatile sig_atomic_t g_handler_sigterm = 0;
-static volatile sig_atomic_t g_handler_sighup = 0;
-static volatile sig_atomic_t g_handler_sigusr1 = 0;
+static VIRT_TimingStats g_timing_stats = {};
 
-static void virt_signal_handler(int sig) {
-    switch (sig) {
-        case SIGTERM:
-        case SIGINT:
-            g_handler_sigterm = 1;
-            break;
-        case SIGHUP:
-            g_handler_sighup = 1;
-            break;
-        case SIGUSR1:
-            g_handler_sigusr1 = 1;
-            break;
+static inline uint64_t virt_timing_get_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void virt_timing_record_start(uint64_t *start_ns) {
+    *start_ns = virt_timing_get_ns();
+}
+
+static void virt_timing_record_end(uint64_t start_ns) {
+    uint64_t elapsed = virt_timing_get_ns() - start_ns;
+    g_timing_stats.total_processing_ns += elapsed;
+    g_timing_stats.operation_count++;
+    if (elapsed > 500000) {
+        g_timing_stats.timing_violations++;
+        VIRT_LOGW("Slow interception: %llu ns", (unsigned long long)elapsed);
     }
 }
 
-static void virt_setup_signal_handlers(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = virt_signal_handler;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
+/* --- Jitter for timing analysis defense --- */
+static void virt_timing_add_jitter(bool enabled) {
+    if (!enabled) return;
+    static unsigned int jitter_seed = 0xDEADBEEF;
+    if (jitter_seed == 0) jitter_seed = (unsigned int)virt_timing_get_ns();
+    jitter_seed = jitter_seed * 1103515245 + 12345;
+    int delay_us = (jitter_seed >> 16) & 0x3F;
+    if (delay_us > 0) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = delay_us * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* --- Nanosleep wrapper handling EINTR --- */
+static __attribute__((unused)) int virt_nanosleep_wrapper(const struct timespec *req) {
+    struct timespec rem;
+    int ret;
+    do {
+        ret = nanosleep(req, &rem);
+        if (ret < 0 && errno == EINTR) {
+            *((struct timespec*)req) = rem;
+            continue;
+        }
+        break;
+    } while (1);
+    return ret;
+}
+
+/* --- Error Recovery Tracking --- */
+typedef struct {
+    uint32_t consecutive_read_errors;
+    uint32_t consecutive_respond_errors;
+    uint32_t consecutive_notif_errors;
+    uint32_t consecutive_addfd_errors;
+    uint32_t max_consecutive_errors;
+    bool self_healing_mode;
+    struct timespec last_successful_operation;
+} VIRT_ErrorRecovery;
+
+static VIRT_ErrorRecovery g_error_recovery = {
+    .max_consecutive_errors = 5,
+    .self_healing_mode = false,
+};
+
+static void virt_error_record(bool success, const char *operation) {
+    if (success) {
+        g_error_recovery.consecutive_read_errors = 0;
+        g_error_recovery.consecutive_respond_errors = 0;
+        g_error_recovery.consecutive_notif_errors = 0;
+        g_error_recovery.consecutive_addfd_errors = 0;
+        clock_gettime(CLOCK_MONOTONIC, &g_error_recovery.last_successful_operation);
+        if (g_error_recovery.self_healing_mode) {
+            VIRT_LOGI("Self-healing: operation recovered");
+            g_error_recovery.self_healing_mode = false;
+        }
+        return;
+    }
+    if (strcmp(operation, "read") == 0) {
+        g_error_recovery.consecutive_read_errors++;
+        if (g_error_recovery.consecutive_read_errors >= g_error_recovery.max_consecutive_errors) {
+            VIRT_LOGW("Self-healing mode activated: too many read errors");
+            g_error_recovery.self_healing_mode = true;
+        }
+    } else if (strcmp(operation, "respond") == 0) {
+        g_error_recovery.consecutive_respond_errors++;
+    } else if (strcmp(operation, "notif") == 0) {
+        g_error_recovery.consecutive_notif_errors++;
+    } else if (strcmp(operation, "addfd") == 0) {
+        g_error_recovery.consecutive_addfd_errors++;
+    }
+}
+
+static __attribute__((unused)) void virt_error_self_heal(void) {
+    if (!g_error_recovery.self_healing_mode) return;
+    VIRT_LOGI("Self-healing: attempting recovery");
+    g_error_recovery.self_healing_mode = false;
+}
+
+/* Latency histogram */
+static const uint64_t g_latency_bucket_ns[VIRT_LATENCY_BUCKETS] = {
+    1000, 5000, 10000, 50000, 100000, 500000,
+    1000000, UINT64_MAX
+};
+static uint64_t g_latency_histogram[VIRT_LATENCY_BUCKETS] = {0};
+
+static int g_handler_timerfd = -1;
+static int g_inotify_fd = -1;
+static int g_signalfd = -1;
+
+static int virt_create_handler_timer(void) {
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (fd < 0) return -1;
+    struct itimerspec ts = {
+        .it_interval = { .tv_sec = 5, .tv_nsec = 0 },
+        .it_value = { .tv_sec = 5, .tv_nsec = 0 },
+    };
+    timerfd_settime(fd, 0, &ts, NULL);
+    return fd;
+}
+
+static int virt_setup_inotify(void) {
+    int fd = inotify_init1(IN_NONBLOCK);
+    if (fd < 0) return -1;
+    inotify_add_watch(fd, "/data/local/tmp/virtualizer/config.txt", IN_CLOSE_WRITE);
+    inotify_add_watch(fd, "/data/local/tmp/virtualizer/rules.json", IN_CLOSE_WRITE);
+    return fd;
+}
+
+static int virt_setup_signalfd(void) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+    sigaddset(&mask, SIGPIPE);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+    return signalfd(-1, &mask, SFD_NONBLOCK);
 }
 
 const char *VIRT_DECOY_MAPS_PATH = "/data/local/tmp/clean_maps";
@@ -66,6 +190,12 @@ const char *VIRT_DECOY_ENVIRON_PATH = "/data/local/tmp/clean_environ";
 const char *VIRT_DECOY_UPTIME_PATH = "/data/local/tmp/clean_uptime";
 const char *VIRT_DECOY_STAT_PATH = "/data/local/tmp/clean_stat";
 const char *VIRT_DECOY_SELINUX_PATH = "/data/local/tmp/clean_selinux";
+const char *VIRT_DECOY_VERSION_PATH = "/data/local/tmp/clean_version";
+const char *VIRT_DECOY_BOOTID_PATH = "/data/local/tmp/clean_boot_id";
+const char *VIRT_DECOY_HOSTNAME_PATH = "/data/local/tmp/clean_hostname";
+const char *VIRT_DECOY_OSRELEASE_PATH = "/data/local/tmp/clean_osrelease";
+const char *VIRT_DECOY_OSTYPE_PATH = "/data/local/tmp/clean_ostype";
+const char *VIRT_DECOY_CPUINFO_PATH = "/data/local/tmp/clean_cpuinfo";
 
 static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
     "1 0 0:0 / / rw,relatime shared:1 - rootfs rootfs rw",
@@ -108,6 +238,75 @@ static const char *VIRT_FAKE_STAT_CONTENT[] = {
 
 static const char *VIRT_FAKE_SELINUX_CONTENT[] = {
     "u:r:untrusted_app:s0:c512,c768",
+    NULL,
+};
+
+static const char *VIRT_FAKE_VERSION_CONTENT[] = {
+    "Linux version 5.10.149-android13-4-00001-gdeadbeef (build-user@build-host) "
+    "(Android clang version 16.0.2) "
+    "#1 SMP PREEMPT Thu Jan 1 00:00:00 UTC 2024",
+    NULL,
+};
+
+static const char *VIRT_FAKE_BOOTID_CONTENT[] = {
+    "deadbeef-cafe-babe-0123-456789abcdef",
+    NULL,
+};
+
+static const char *VIRT_FAKE_HOSTNAME_CONTENT[] = {
+    "localhost",
+    NULL,
+};
+
+static const char *VIRT_FAKE_OSRELEASE_CONTENT[] = {
+    "5.10.149-android13-4-00001-gdeadbeef",
+    NULL,
+};
+
+static const char *VIRT_FAKE_OSTYPE_CONTENT[] = {
+    "Linux",
+    NULL,
+};
+
+static const char *VIRT_FAKE_CPUINFO_CONTENT[] = {
+    "Processor\t: AArch64 Processor rev 14 (aarch64)",
+    "processor\t: 0",
+    "BogoMIPS\t: 38.40",
+    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs",
+    "CPU implementer\t: 0x51",
+    "CPU architecture\t: 8",
+    "CPU variant\t: 0x2",
+    "CPU part\t: 0x801",
+    "CPU revision\t: 14",
+    "",
+    "processor\t: 1",
+    "BogoMIPS\t: 38.40",
+    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs",
+    "CPU implementer\t: 0x51",
+    "CPU architecture\t: 8",
+    "CPU variant\t: 0x2",
+    "CPU part\t: 0x801",
+    "CPU revision\t: 14",
+    "",
+    "processor\t: 2",
+    "BogoMIPS\t: 38.40",
+    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs",
+    "CPU implementer\t: 0x51",
+    "CPU architecture\t: 8",
+    "CPU variant\t: 0x2",
+    "CPU part\t: 0x801",
+    "CPU revision\t: 14",
+    "",
+    "processor\t: 3",
+    "BogoMIPS\t: 38.40",
+    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs",
+    "CPU implementer\t: 0x51",
+    "CPU architecture\t: 8",
+    "CPU variant\t: 0x2",
+    "CPU part\t: 0x801",
+    "CPU revision\t: 14",
+    "",
+    "Hardware\t: Qualcomm Technologies, Inc SM8550",
     NULL,
 };
 
@@ -270,7 +469,7 @@ static int bpf_compiler_ret(BPFCompiler *c, uint32_t k) {
 }
 
 static int bpf_compiler_compile(BPFCompiler *c, VIRT_SeccompFilterProfile *profiles,
-                                 int profile_count) {
+                                 int profile_count, VIRT_Config *cfg) {
     int arch_insn = -1;
     int arch_jump = -1;
     int arch_allow = -1;
@@ -292,9 +491,33 @@ static int bpf_compiler_compile(BPFCompiler *c, VIRT_SeccompFilterProfile *profi
     load_nr = bpf_compiler_ld_abs(c, 0);
     if (load_nr < 0) return -1;
 
+    auto should_intercept = [&](int idx) -> bool {
+        if (!profiles[idx].intercept) return false;
+        if (cfg) {
+            switch (profiles[idx].syscall_nr) {
+                case __NR_openat:
+                case __NR_openat2:
+                    if (!cfg->enable_openat_intercept) return false;
+                    break;
+                case __NR_readlinkat:
+                case __NR_readlink:
+                    if (!cfg->enable_readlinkat_intercept) return false;
+                    break;
+                case __NR_connect:
+                    if (!cfg->enable_connect_intercept) return false;
+                    break;
+                case __NR_mmap:
+                    if (!cfg->enable_mmap_intercept) return false;
+                    break;
+            }
+        }
+        if (!virt_seccomp_is_syscall_enabled(profiles[idx].syscall_nr)) return false;
+        return true;
+    };
+
     int match_count = 0;
     for (int i = 0; i < profile_count && profiles[i].syscall_nr >= 0; i++) {
-        if (profiles[i].intercept) {
+        if (should_intercept(i)) {
             if (c->matched_nrs && match_count < c->max_matches) {
                 c->matched_nrs[match_count] = profiles[i].syscall_nr;
             }
@@ -310,7 +533,7 @@ static int bpf_compiler_compile(BPFCompiler *c, VIRT_SeccompFilterProfile *profi
 
     int remaining = match_count;
     for (int i = 0; i < profile_count && profiles[i].syscall_nr >= 0; i++) {
-        if (!profiles[i].intercept) continue;
+        if (!should_intercept(i)) continue;
         remaining--;
         int skip = remaining + 1;
         int idx = bpf_compiler_jeq(c, (uint32_t)profiles[i].syscall_nr,
@@ -438,7 +661,7 @@ int virt_seccomp_install_static(VIRT_Config *cfg,
     BPFCompiler compiler;
     bpf_compiler_init(&compiler, filter_buf, 128, nr_buf, 64);
 
-    int total_insns = bpf_compiler_compile(&compiler, profiles, profile_count);
+    int total_insns = bpf_compiler_compile(&compiler, profiles, profile_count, cfg);
     if (total_insns < 0) {
         VIRT_LOGE("BPF compilation failed");
         return VIRT_ERR_INVAL;
@@ -537,6 +760,30 @@ int virt_seccomp_create_decoy_files(void) {
         VIRT_LOGD("Decoy selinux context created at %s", VIRT_DECOY_SELINUX_PATH);
         ok++;
     }
+    if (virt_decoy_file_create(VIRT_DECOY_VERSION_PATH, VIRT_FAKE_VERSION_CONTENT)) {
+        VIRT_LOGD("Decoy version created at %s", VIRT_DECOY_VERSION_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_BOOTID_PATH, VIRT_FAKE_BOOTID_CONTENT)) {
+        VIRT_LOGD("Decoy boot_id created at %s", VIRT_DECOY_BOOTID_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_HOSTNAME_PATH, VIRT_FAKE_HOSTNAME_CONTENT)) {
+        VIRT_LOGD("Decoy hostname created at %s", VIRT_DECOY_HOSTNAME_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_OSRELEASE_PATH, VIRT_FAKE_OSRELEASE_CONTENT)) {
+        VIRT_LOGD("Decoy osrelease created at %s", VIRT_DECOY_OSRELEASE_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_OSTYPE_PATH, VIRT_FAKE_OSTYPE_CONTENT)) {
+        VIRT_LOGD("Decoy ostype created at %s", VIRT_DECOY_OSTYPE_PATH);
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_CPUINFO_PATH, VIRT_FAKE_CPUINFO_CONTENT)) {
+        VIRT_LOGD("Decoy cpuinfo created at %s", VIRT_DECOY_CPUINFO_PATH);
+        ok++;
+    }
     return ok;
 }
 
@@ -549,6 +796,108 @@ int virt_seccomp_install_static_default(VIRT_Config *cfg) {
         (VIRT_SeccompFilterProfile *)DEFAULT_FILTER_PROFILES,
         ARRAY_COUNT(DEFAULT_FILTER_PROFILES)
     );
+}
+
+int virt_seccomp_reload_filter(int new_filter_fd) {
+    if (new_filter_fd < 0) return VIRT_ERR_INVAL;
+    if (g_current_filter_fd >= 0 && g_current_filter_fd != new_filter_fd) {
+        close(g_current_filter_fd);
+    }
+    g_current_filter_fd = new_filter_fd;
+    VIRT_LOGD("Filter fd updated: %d -> %d", g_current_filter_fd, new_filter_fd);
+    return VIRT_OK;
+}
+
+int virt_seccomp_enable_syscall(int nr) {
+    for (int i = 0; i < g_syscall_toggle_count; i++) {
+        if (g_syscall_toggles[i].syscall_nr == nr) {
+            g_syscall_toggles[i].enabled = true;
+            return VIRT_OK;
+        }
+    }
+    if (g_syscall_toggle_count < 64) {
+        g_syscall_toggles[g_syscall_toggle_count].syscall_nr = nr;
+        g_syscall_toggles[g_syscall_toggle_count].enabled = true;
+        g_syscall_toggle_count++;
+        return VIRT_OK;
+    }
+    return VIRT_ERR_NOMEM;
+}
+
+int virt_seccomp_disable_syscall(int nr) {
+    for (int i = 0; i < g_syscall_toggle_count; i++) {
+        if (g_syscall_toggles[i].syscall_nr == nr) {
+            g_syscall_toggles[i].enabled = false;
+            return VIRT_OK;
+        }
+    }
+    return VIRT_ERR_INVAL;
+}
+
+bool virt_seccomp_is_syscall_enabled(int nr) {
+    for (int i = 0; i < g_syscall_toggle_count; i++) {
+        if (g_syscall_toggles[i].syscall_nr == nr) {
+            return g_syscall_toggles[i].enabled;
+        }
+    }
+    return true;
+}
+
+int virt_seccomp_compile_and_install(VIRT_Config *cfg,
+                                     VIRT_SeccompFilterProfile *profiles,
+                                     int profile_count) {
+    if (!cfg || !profiles) return VIRT_ERR_INVAL;
+
+    sock_filter filter_buf[128];
+    int nr_buf[64];
+    BPFCompiler compiler;
+    bpf_compiler_init(&compiler, filter_buf, 128, nr_buf, 64);
+
+    int total_insns = bpf_compiler_compile(&compiler, profiles, profile_count, cfg);
+    if (total_insns < 0) {
+        VIRT_LOGE("BPF recompilation failed during reload");
+        return VIRT_ERR_BPF;
+    }
+
+    struct sock_fprog prog;
+    prog.len = total_insns;
+    prog.filter = filter_buf;
+
+    int filter_flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+    if (cfg->enable_thread_sync && g_seccomp_engine_has_tsync) {
+        filter_flags |= SECCOMP_FILTER_FLAG_TSYNC;
+        if (g_seccomp_engine_features & 32) {
+            filter_flags |= SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+        }
+    }
+
+    int notify_fd = (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                                  filter_flags, &prog);
+
+    if (notify_fd < 0) {
+        VIRT_LOGE("BPF reinstall failed (flags=0x%x): %s",
+                   filter_flags, strerror(errno));
+
+        if (errno == EINVAL && (filter_flags & SECCOMP_FILTER_FLAG_TSYNC)) {
+            filter_flags &= ~SECCOMP_FILTER_FLAG_TSYNC;
+            filter_flags &= ~SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+            notify_fd = (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                                      filter_flags, &prog);
+        }
+
+        if (notify_fd < 0) {
+            VIRT_LOGE("BPF reinstall retry failed: %s", strerror(errno));
+            return VIRT_ERR_SECCOMP;
+        }
+    }
+
+    virt_seccomp_reload_filter(notify_fd);
+
+    VIRT_LOGI("BPF filter recompiled and installed (new_fd=%d, flags=0x%x, "
+              "insns=%d, matches=%d)",
+              notify_fd, filter_flags, total_insns, compiler.matched_count);
+
+    return notify_fd;
 }
 
 static long virt_seccomp_execute_faccessat(uint64_t a0, uint64_t a1, uint64_t a2) {
@@ -765,6 +1114,9 @@ long virt_seccomp_execute_syscall(struct seccomp_notif *req) {
             return virt_seccomp_execute_mprotect(a0, a1, a2);
         case __NR_uname:
             return virt_seccomp_execute_uname(a0, pid);
+        case __NR_unlinkat:
+        case __NR_renameat2:
+            return 0;
         default:
             __sync_fetch_and_add(&g_seccomp_engine_errors, 1);
             return -ENOSYS;
@@ -811,7 +1163,15 @@ int virt_seccomp_handler_loop(void *arg) {
     int notify_fd = (int)(intptr_t)arg;
     prctl(PR_SET_NAME, "seccomp-virt", 0, 0, 0);
 
-    virt_setup_signal_handlers();
+    g_handler_timerfd = virt_create_handler_timer();
+    g_inotify_fd = virt_setup_inotify();
+    g_signalfd = virt_setup_signalfd();
+    if (g_handler_timerfd >= 0)
+        VIRT_LOGD("Handler timer created (fd=%d)", g_handler_timerfd);
+    if (g_inotify_fd >= 0)
+        VIRT_LOGD("Inotify created (fd=%d)", g_inotify_fd);
+    if (g_signalfd >= 0)
+        VIRT_LOGD("Signalfd created (fd=%d)", g_signalfd);
 
     struct seccomp_notif req;
     struct seccomp_notif_resp resp;
@@ -843,6 +1203,9 @@ int virt_seccomp_handler_loop(void *arg) {
         free(stats);
         free(proc_hider);
         close(notify_fd);
+        if (g_handler_timerfd >= 0) { close(g_handler_timerfd); g_handler_timerfd = -1; }
+        if (g_inotify_fd >= 0) { close(g_inotify_fd); g_inotify_fd = -1; }
+        if (g_signalfd >= 0) { close(g_signalfd); g_signalfd = -1; }
         return VIRT_ERR_NOMEM;
     }
     assert(cache != NULL);
@@ -914,6 +1277,12 @@ int virt_seccomp_handler_loop(void *arg) {
 
     virt_proc_hider_init(proc_hider);
     virt_proc_hider_add_fd(proc_hider, notify_fd);
+    if (g_handler_timerfd >= 0)
+        virt_proc_hider_add_fd(proc_hider, g_handler_timerfd);
+    if (g_inotify_fd >= 0)
+        virt_proc_hider_add_fd(proc_hider, g_inotify_fd);
+    if (g_signalfd >= 0)
+        virt_proc_hider_add_fd(proc_hider, g_signalfd);
     g_seccomp_engine_proc_hider = proc_hider;
 
     jitter.enabled = false;
@@ -935,44 +1304,41 @@ int virt_seccomp_handler_loop(void *arg) {
 
     while (true) {
         uint64_t loop_start = virt_gettime_ns();
+        uint64_t event_start_ns = 0;
+        virt_timing_record_start(&event_start_ns);
         memset(&req, 0, sizeof(req));
+        bool shutdown_requested = false;
 
-        struct pollfd pfd = {
-            .fd = notify_fd,
-            .events = POLLIN,
-            .revents = 0,
-        };
+        struct pollfd pfds[4];
+        int nfds = 0;
 
-        if (g_handler_sigterm) {
-            VIRT_LOGI("Handler: SIGTERM/SIGINT received, shutting down");
-            break;
-        }
-        if (g_handler_sighup) {
-            g_handler_sighup = 0;
-            uint32_t old_count = rule_count;
-            virt_rules_load_defaults(rules, &rule_count, VIRT_MAX_RULES);
-            int json_count = virt_rules_load_json(
-                VIRT_DEFAULT_CONFIG.rules_json_path,
-                rules, &rule_count, VIRT_MAX_RULES);
-            if (json_count >= 0) {
-                virt_rules_sort(rules, rule_count);
-                VIRT_LOGI("Handler: SIGHUP rule reload (%u -> %u rules%s)",
-                          old_count, rule_count,
-                          json_count > 0 ? ", +JSON" : "");
-            } else {
-                VIRT_LOGI("Handler: SIGHUP reloaded %u default rules (no JSON)",
-                          rule_count);
-            }
-            health.active_rules = rule_count;
-        }
-        if (g_handler_sigusr1) {
-            g_handler_sigusr1 = 0;
-            char stats_buf[2048];
-            virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
-            VIRT_LOGI("Handler: SIGUSR1 stats dump\n%s", stats_buf);
+        pfds[nfds].fd = notify_fd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+
+        if (g_handler_timerfd >= 0) {
+            pfds[nfds].fd = g_handler_timerfd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
         }
 
-        int poll_rc = poll(&pfd, 1, VIRT_NOTIF_FD_TIMEOUT_MS);
+        if (g_inotify_fd >= 0) {
+            pfds[nfds].fd = g_inotify_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+
+        if (g_signalfd >= 0) {
+            pfds[nfds].fd = g_signalfd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+
+        int poll_rc = poll(pfds, nfds, -1);
         if (poll_rc < 0) {
             if (errno == EINTR) continue;
             VIRT_LOGE("poll error: %s", strerror(errno));
@@ -980,20 +1346,137 @@ int virt_seccomp_handler_loop(void *arg) {
             if (health.consecutive_errors > 10) break;
             continue;
         }
-        if (poll_rc == 0) {
-            if (watchdog_ok) {
-                int wd_rc = virt_watchdog_check(&watchdog);
-                if (wd_rc < 0) {
-                    VIRT_LOGE("Watchdog triggered");
-                    health.last_error = wd_rc;
-                    virt_safe_strncpy(health.last_error_msg,
-                                      "Watchdog timeout",
-                                      sizeof(health.last_error_msg));
-                    if (++health.consecutive_errors > 5) break;
+
+        int fd_idx = 0;
+        bool notify_ready = pfds[fd_idx].revents & POLLIN;
+        fd_idx++;
+
+        if (g_handler_timerfd >= 0) {
+            if (pfds[fd_idx].revents & POLLIN) {
+                uint64_t expirations;
+                ssize_t n = read(g_handler_timerfd, &expirations, sizeof(expirations));
+                if (n > 0 && watchdog_ok) {
+                    int wd_rc = virt_watchdog_check(&watchdog);
+                    if (wd_rc < 0) {
+                        VIRT_LOGE("Watchdog triggered via timerfd");
+                        health.last_error = wd_rc;
+                        virt_safe_strncpy(health.last_error_msg,
+                                          "Watchdog timeout",
+                                          sizeof(health.last_error_msg));
+                        if (++health.consecutive_errors > 5) break;
+                    }
                 }
             }
-            continue;
+            fd_idx++;
         }
+
+        if (g_inotify_fd >= 0) {
+            if (pfds[fd_idx].revents & POLLIN) {
+                char in_buf[4096] __attribute__((aligned(4)));
+                ssize_t n = read(g_inotify_fd, in_buf, sizeof(in_buf));
+                if (n > 0) {
+                    size_t offset = 0;
+                    while (offset < (size_t)n) {
+                        struct inotify_event *ev = (struct inotify_event *)(in_buf + offset);
+                        if (ev->len > 0) {
+                            if (strstr(ev->name, "config.txt")) {
+                                VIRT_LOGI("inotify: config.txt changed, reloading config");
+                                virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &decoy_cfg);
+                                virt_config_validate(&decoy_cfg);
+                                virt_decoy_init(&decoy_cfg);
+                            } else if (strstr(ev->name, "rules.json")) {
+                                VIRT_LOGI("inotify: rules.json changed, reloading rules");
+                                uint32_t old_count = rule_count;
+                                virt_rules_load_defaults(rules, &rule_count, VIRT_MAX_RULES);
+                                int json_count = virt_rules_load_json(
+                                    VIRT_DEFAULT_CONFIG.rules_json_path,
+                                    rules, &rule_count, VIRT_MAX_RULES);
+                                if (json_count >= 0) {
+                                    virt_rules_sort(rules, rule_count);
+                                    VIRT_LOGI("Rules reloaded (%u -> %u rules%s)",
+                                              old_count, rule_count,
+                                              json_count > 0 ? ", +JSON" : "");
+                                }
+                                health.active_rules = rule_count;
+                            }
+                        }
+                        offset += sizeof(struct inotify_event) + ev->len;
+                    }
+                }
+            }
+            fd_idx++;
+        }
+
+        if (g_signalfd >= 0) {
+            if (pfds[fd_idx].revents & POLLIN) {
+                struct signalfd_siginfo ssi;
+                ssize_t n = read(g_signalfd, &ssi, sizeof(ssi));
+                if (n == sizeof(ssi)) {
+                    switch (ssi.ssi_signo) {
+                        case SIGTERM:
+                        case SIGINT:
+                            VIRT_LOGI("Handler: SIGTERM/SIGINT via signalfd, shutting down");
+                            shutdown_requested = true;
+                            break;
+                        case SIGHUP: {
+                            uint32_t old_count = rule_count;
+                            virt_rules_load_defaults(rules, &rule_count, VIRT_MAX_RULES);
+                            int json_count = virt_rules_load_json(
+                                VIRT_DEFAULT_CONFIG.rules_json_path,
+                                rules, &rule_count, VIRT_MAX_RULES);
+                            if (json_count >= 0) {
+                                virt_rules_sort(rules, rule_count);
+                                VIRT_LOGI("Handler: SIGHUP rule reload (%u -> %u rules%s)",
+                                          old_count, rule_count,
+                                          json_count > 0 ? ", +JSON" : "");
+                            } else {
+                                VIRT_LOGI("Handler: SIGHUP reloaded %u default rules (no JSON)",
+                                          rule_count);
+                            }
+                            health.active_rules = rule_count;
+
+                            {
+                                VIRT_Config reload_cfg = decoy_cfg;
+                                if (virt_config_load(VIRT_DEFAULT_CONFIG.config_path,
+                                                     &reload_cfg) == VIRT_OK) {
+                                    virt_config_validate(&reload_cfg);
+                                }
+                                int bpf_ret = virt_seccomp_compile_and_install(
+                                    &reload_cfg,
+                                    (VIRT_SeccompFilterProfile *)DEFAULT_FILTER_PROFILES,
+                                    ARRAY_COUNT(DEFAULT_FILTER_PROFILES));
+                                if (bpf_ret >= 0) {
+                                    VIRT_LOGI("Handler: SIGHUP BPF filter reloaded (fd=%d)",
+                                              bpf_ret);
+                                } else {
+                                    VIRT_LOGE("Handler: SIGHUP BPF filter reload failed: %s",
+                                              virt_strerror(bpf_ret));
+                                }
+                            }
+                            break;
+                        }
+                        case SIGUSR1: {
+                            char stats_buf[2048];
+                            virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
+                            VIRT_LOGI("Handler: SIGUSR1 stats dump\n%s", stats_buf);
+                            break;
+                        }
+                        case SIGUSR2: {
+                            VIRT_LOGI("Handler: SIGUSR2 latency dump + benchmark");
+                            virt_latency_dump();
+                            virt_benchmark_run(1000);
+                            break;
+                        }
+                        case SIGPIPE:
+                            break;
+                    }
+                }
+            }
+            fd_idx++;
+        }
+
+        if (shutdown_requested) break;
+        if (!notify_ready) continue;
 
         int rc = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req);
         if (rc < 0) {
@@ -1008,6 +1491,7 @@ int virt_seccomp_handler_loop(void *arg) {
                 health.fd_valid = false;
                 break;
             }
+            virt_error_record(false, "notif");
             VIRT_LOGE("NOTIF_RECV error %d: %s", errno, strerror(errno));
             health.consecutive_errors++;
             if (health.consecutive_errors > 10) break;
@@ -1033,6 +1517,8 @@ int virt_seccomp_handler_loop(void *arg) {
             case __NR_statx:
             case __NR_faccessat:
             case __NR_faccessat2:
+            case __NR_unlinkat:
+            case __NR_renameat2:
                 path_addr = req.data.args[1];
                 break;
             case __NR_mmap:
@@ -1144,6 +1630,43 @@ int virt_seccomp_handler_loop(void *arg) {
                     resolved = true;
                     action = VIRT_ACTION_ALLOW;
                 }
+            }
+        }
+
+        /* --- VIRT_ACTION_MONITOR Handling ---
+         * Monitor paths log and then allow (pass through). */
+        if (resolved && action == VIRT_ACTION_MONITOR) {
+            VIRT_LOGD("Monitored path: %s (nr=%d)", path_buf, req.data.nr);
+            virt_log_event("monitor", path_buf, action);
+            action = VIRT_ACTION_ALLOW;
+        }
+
+        /* --- Self-Protection: unlinkat / renameat2 ---
+         * Prevent deletion or renaming of our decoy/protected files.
+         * Set resolved/action and let the response dispatch below handle it. */
+        if (path_readable && path_len > 0 &&
+            (req.data.nr == __NR_unlinkat || req.data.nr == __NR_renameat2)) {
+            static const char *protected_prefixes[] = {
+                "/data/local/tmp/clean_",
+                "/data/local/tmp/virtualizer/",
+                "/data/local/tmp/.virt_",
+                NULL
+            };
+            bool protect = false;
+            for (size_t pi = 0; protected_prefixes[pi]; pi++) {
+                size_t plen = strlen(protected_prefixes[pi]);
+                if ((size_t)path_len >= plen &&
+                    memcmp(path_buf, protected_prefixes[pi], plen) == 0) {
+                    protect = true;
+                    break;
+                }
+            }
+            if (protect) {
+                resolved = true;
+                action = VIRT_ACTION_BLOCK_ENOENT;
+                VIRT_LOGW("Self-protect: blocked %s on %s",
+                          virt_syscall_name(req.data.nr), path_buf);
+                virt_log_event("self-protect", path_buf, action);
             }
         }
 
@@ -1270,11 +1793,26 @@ int virt_seccomp_handler_loop(void *arg) {
                 else if (strstr(path_buf, "attr/current") ||
                          strstr(path_buf, "attr/"))
                     redirect_path = VIRT_DECOY_SELINUX_PATH;
+                else if (strstr(path_buf, "/proc/version"))
+                    redirect_path = VIRT_DECOY_VERSION_PATH;
+                else if (strstr(path_buf, "boot_id"))
+                    redirect_path = VIRT_DECOY_BOOTID_PATH;
+                else if (strstr(path_buf, "/hostname"))
+                    redirect_path = VIRT_DECOY_HOSTNAME_PATH;
+                else if (strstr(path_buf, "/osrelease"))
+                    redirect_path = VIRT_DECOY_OSRELEASE_PATH;
+                else if (strstr(path_buf, "/ostype"))
+                    redirect_path = VIRT_DECOY_OSTYPE_PATH;
+                else if (strstr(path_buf, "cpuinfo"))
+                    redirect_path = VIRT_DECOY_CPUINFO_PATH;
                 if (redirect_path) {
                     int new_fd = virt_seccomp_try_addfd(notify_fd, &req,
                                                          redirect_path);
+                    virt_error_record(new_fd >= 0, "addfd");
                     if (new_fd >= 0) {
                         should_redirect = true;
+                        if (proc_hider)
+                            virt_proc_hider_add_fd(proc_hider, new_fd);
                         if (VIRT_LOG_LEVEL >= VIRT_LOG_LEVEL_DEBUG)
                             VIRT_LOGD("[openat] REDIRECT %s -> fd=%d",
                                       path_buf, new_fd);
@@ -1295,10 +1833,13 @@ int virt_seccomp_handler_loop(void *arg) {
                 decoy = VIRT_DECOY_ENVIRON_PATH;
             if (decoy) {
                 int new_fd = virt_seccomp_try_addfd(notify_fd, &req, decoy);
+                virt_error_record(new_fd >= 0, "addfd");
                 if (new_fd >= 0) {
                     should_redirect = true;
                     resolved = true;
                     action = VIRT_ACTION_ALLOW;
+                    if (proc_hider)
+                        virt_proc_hider_add_fd(proc_hider, new_fd);
                     if (VIRT_LOG_LEVEL >= VIRT_LOG_LEVEL_DEBUG)
                         VIRT_LOGD("[openat] SPOOF %s -> %s", path_buf, decoy);
                 }
@@ -1350,7 +1891,9 @@ int virt_seccomp_handler_loop(void *arg) {
                     (uintptr_t)req.data.args[0] < sm->execution_base + sm->segment_size)
                     send_direct = true;
             }
-            if (req.data.nr == __NR_connect && resolved &&
+            if ((req.data.nr == __NR_connect ||
+                 req.data.nr == __NR_unlinkat ||
+                 req.data.nr == __NR_renameat2) && resolved &&
                 action != VIRT_ACTION_ALLOW &&
                 action != VIRT_ACTION_PASS_THROUGH) {
                 send_direct = true;
@@ -1375,6 +1918,10 @@ int virt_seccomp_handler_loop(void *arg) {
         }
 
         uint64_t total_time = virt_gettime_ns() - loop_start;
+
+        virt_timing_record_end(event_start_ns);
+        virt_error_record(rc >= 0, "respond");
+        virt_timing_add_jitter(decoy_cfg.enable_timing_jitter);
 
         if (rc < 0) {
             if (errno == EOPNOTSUPP || errno == EINVAL) {
@@ -1424,6 +1971,13 @@ int virt_seccomp_handler_loop(void *arg) {
             }
         }
 
+        /* Record per-syscall latency via new histogram system */
+        {
+            const char *sname = virt_syscall_name(req.data.nr);
+            virt_latency_record(sname, total_time);
+            virt_latency_record("total", total_time);
+        }
+
         /* Update history entry with final latency */
         {
             uint32_t hp = (history_pos - 1) % 256;
@@ -1431,9 +1985,9 @@ int virt_seccomp_handler_loop(void *arg) {
             history[hp].action = action;
         }
 
-        if (stats_ok) {
-            virt_stats_record(stats, req.data.nr, action, total_time);
-        }
+            if (stats_ok) {
+                stats->allowed_calls++;
+            }
 
         if (watchdog_ok && g_seccomp_engine_has_continue) {
             virt_watchdog_ping(&watchdog);
@@ -1455,12 +2009,29 @@ int virt_seccomp_handler_loop(void *arg) {
         }
 
         if (health.processed_events % 5000 == 0) {
+            int pressure = virt_mem_check_pressure();
+            if (cache_count > VIRT_MAX_CACHED_PATHS / 2) {
+                VIRT_LOGD("Cache large: %u/%u entries, pressure=%d",
+                          cache_count, VIRT_MAX_CACHED_PATHS, pressure);
+            }
+            if (pressure > 0) {
+                virt_mem_reduce_footprint();
+            }
+
             char stats_buf[2048];
             virt_stats_snapshot(stats, stats_buf, sizeof(stats_buf));
             {
-                char hist_buf[512];
+                char hist_buf[640];
                 int h_off = 0;
-                h_off += snprintf(hist_buf, sizeof(hist_buf), "LatHist:");
+                uint64_t timing_avg = g_timing_stats.operation_count > 0
+                    ? g_timing_stats.total_processing_ns / g_timing_stats.operation_count : 0;
+                h_off += snprintf(hist_buf, sizeof(hist_buf),
+                    "TimingStats: ops=%lu avg=%luns violations=%lu ",
+                    (unsigned long)g_timing_stats.operation_count,
+                    (unsigned long)timing_avg,
+                    (unsigned long)g_timing_stats.timing_violations);
+                h_off += snprintf(hist_buf + h_off, (size_t)(sizeof(hist_buf) - h_off),
+                    "LatHist:");
                 for (int bi = 0; bi < VIRT_LATENCY_BUCKETS && h_off < (int)sizeof(hist_buf) - 24; bi++) {
                     if (g_latency_histogram[bi] == 0) continue;
                     if (g_latency_bucket_ns[bi] == UINT64_MAX) {
@@ -1475,7 +2046,8 @@ int virt_seccomp_handler_loop(void *arg) {
                                           (unsigned long)g_latency_histogram[bi]);
                     }
                 }
-                VIRT_LOGI("Periodic stats:\n%s\n%s", stats_buf, hist_buf);
+                VIRT_LOGI("Periodic stats:\n%s\n%s%s", stats_buf, hist_buf,
+                          pressure > 0 ? " [MEM PRESSURE]" : "");
             }
         }
 
@@ -1495,23 +2067,31 @@ int virt_seccomp_handler_loop(void *arg) {
     if (notify_fd >= 0) {
         close(notify_fd);
     }
+    if (g_handler_timerfd >= 0) { close(g_handler_timerfd); g_handler_timerfd = -1; }
+    if (g_inotify_fd >= 0) { close(g_inotify_fd); g_inotify_fd = -1; }
+    if (g_signalfd >= 0) { close(g_signalfd); g_signalfd = -1; }
 
     double avg_lat = g_seccomp_engine_total_latency_ns /
                      (double)VIRT_MAX(health.processed_events, 1ULL);
     double cache_hit_pct = (cache_hits + cache_misses) > 0
         ? 100.0 * (double)cache_hits / (double)(cache_hits + cache_misses) : 0.0;
 
+    uint64_t timing_avg = g_timing_stats.operation_count > 0
+        ? g_timing_stats.total_processing_ns / g_timing_stats.operation_count : 0;
     VIRT_LOGI(
         "Handler shutdown: total=%lu blocked=%lu errors=%lu "
         "avg_lat=%.0fus max_lat=%luns cache_hit=%.0f%% "
-        "continue_fb=%lu",
+        "continue_fb=%lu timing_ops=%lu timing_avg=%luns timing_violations=%lu",
         (unsigned long)health.processed_events,
         (unsigned long)health.blocked_events,
         (unsigned long)g_seccomp_engine_errors,
         avg_lat / 1000.0,
         (unsigned long)g_seccomp_engine_max_latency_ns,
         cache_hit_pct,
-        (unsigned long)g_seccomp_engine_continue_fallback
+        (unsigned long)g_seccomp_engine_continue_fallback,
+        (unsigned long)g_timing_stats.operation_count,
+        (unsigned long)timing_avg,
+        (unsigned long)g_timing_stats.timing_violations
     );
 
     /* Per-syscall summary */
@@ -1721,6 +2301,11 @@ int virt_health_report(const VIRT_HealthStatus *status,
         "Max Latency (ns):   %lu\n"
         "Min Latency (ns):   %lu\n"
         "Continue Fallbacks: %lu\n"
+        "------------------------\n"
+        "Timing Operations:  %lu\n"
+        "Timing Avg (ns):    %lu\n"
+        "Timing Violations:  %lu\n"
+        "Self-Healing:       %s\n"
         "Last Error:         %d (%s)\n"
         "Last Errno:         %d\n",
         VIRTUALIZER_VERSION,
@@ -1744,6 +2329,11 @@ int virt_health_report(const VIRT_HealthStatus *status,
         (unsigned long)g_seccomp_engine_max_latency_ns,
         (unsigned long)g_seccomp_engine_min_latency_ns,
         (unsigned long)g_seccomp_engine_continue_fallback,
+        (unsigned long)g_timing_stats.operation_count,
+        (unsigned long)(g_timing_stats.operation_count > 0
+            ? g_timing_stats.total_processing_ns / g_timing_stats.operation_count : 0),
+        (unsigned long)g_timing_stats.timing_violations,
+        g_error_recovery.self_healing_mode ? "active" : "inactive",
         status->last_error,
         status->last_error_msg[0] ? status->last_error_msg : "none",
         status->last_errno);

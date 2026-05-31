@@ -13,6 +13,79 @@ static uint32_t g_error_counts[VIRT_ERR_COUNT_MAX] = {0};
         __sync_fetch_and_add(&g_error_counts[_idx], 1); \
 } while (0)
 
+typedef struct {
+    size_t cache_allocated;
+    size_t rules_allocated;
+    size_t trie_nodes;
+    size_t total_allocated;
+    size_t peak_allocated;
+    uint32_t oom_count;
+} VIRT_MemoryStats;
+
+static VIRT_MemoryStats g_mem_stats;
+
+void virt_mem_track_alloc(size_t size) {
+    g_mem_stats.total_allocated += size;
+    if (g_mem_stats.total_allocated > g_mem_stats.peak_allocated) {
+        g_mem_stats.peak_allocated = g_mem_stats.total_allocated;
+    }
+}
+
+void virt_mem_track_free(size_t size) {
+    if (size <= g_mem_stats.total_allocated) {
+        g_mem_stats.total_allocated -= size;
+    }
+}
+
+void virt_mem_record_oom(void) {
+    g_mem_stats.oom_count++;
+}
+
+size_t virt_mem_get_usage(void) {
+    return g_mem_stats.total_allocated;
+}
+
+size_t virt_mem_get_peak(void) {
+    return g_mem_stats.peak_allocated;
+}
+
+int virt_mem_check_pressure(void) {
+    size_t usage = virt_mem_get_usage();
+    if (usage >= VIRT_MEM_CRITICAL_THRESHOLD) {
+        VIRT_LOGW("Memory critical: %zu bytes used", usage);
+        return 2;
+    }
+    if (usage >= VIRT_MEM_PRESSURE_THRESHOLD) {
+        VIRT_LOGW("Memory pressure: %zu bytes used", usage);
+        return 1;
+    }
+    return 0;
+}
+
+void virt_mem_reduce_footprint(void) {
+    virt_cache_flush(NULL, 0);
+    VIRT_LOGI("Memory footprint reduced");
+}
+
+int virt_resource_limits_init(VIRT_ResourceLimits *limits) {
+    if (!limits) return VIRT_ERR_INVAL;
+    limits->max_cache_entries = VIRT_MAX_CACHED_PATHS;
+    limits->max_rules = VIRT_MAX_RULES;
+    limits->max_trie_nodes = 100000;
+    limits->max_event_history = 256;
+    limits->max_log_size = 1048576;
+    limits->enable_strict_mode = false;
+    return VIRT_OK;
+}
+
+int virt_resource_check_limit(uint32_t current, uint32_t max, const char *name) {
+    if (current >= max) {
+        VIRT_LOGW("Resource limit reached: %s (%u/%u)", name, current, max);
+        return VIRT_ERR_BUSY;
+    }
+    return VIRT_OK;
+}
+
 // Print a summary of error counters across all categories.
 void virt_print_error_summary(void) {
     VIRT_LOGI("Error summary: %u OOM, %u INVAL, %u TIMEOUT, %u NODEV, "
@@ -70,6 +143,78 @@ int virt_bloom_check(const char *str, uint32_t len) {
     return 1;
 }
 
+// ---- Latency Histogram ----
+#define VIRT_LATENCY_BUCKET_COUNT 5
+
+typedef struct {
+    const char *name;
+    uint64_t min_latency_ns;
+    uint64_t max_latency_ns;
+    uint64_t total_latency_ns;
+    uint64_t count;
+    uint64_t bucket_limits[VIRT_LATENCY_BUCKETS + 1];
+    uint64_t bucket_counts[VIRT_LATENCY_BUCKETS];
+} VIRT_LatencyBucket;
+
+static VIRT_LatencyBucket g_latency_buckets[] = {
+    {"openat", 0, 0, 0, 0, {1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, UINT64_MAX}, {0}},
+    {"readlinkat", 0, 0, 0, 0, {1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, UINT64_MAX}, {0}},
+    {"connect", 0, 0, 0, 0, {1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, UINT64_MAX}, {0}},
+    {"uname", 0, 0, 0, 0, {1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, UINT64_MAX}, {0}},
+    {"total", 0, 0, 0, 0, {1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, UINT64_MAX}, {0}},
+};
+static const size_t g_latency_bucket_count = sizeof(g_latency_buckets) / sizeof(g_latency_buckets[0]);
+
+static inline int virt_latency_find_bucket(VIRT_LatencyBucket *bucket, uint64_t latency) {
+    for (int i = 0; i < VIRT_LATENCY_BUCKETS; i++) {
+        if (latency <= bucket->bucket_limits[i]) return i;
+    }
+    return VIRT_LATENCY_BUCKETS - 1;
+}
+
+void virt_latency_record(const char *name, uint64_t latency_ns) {
+    if (!name) return;
+    for (size_t i = 0; i < g_latency_bucket_count; i++) {
+        if (strcmp(g_latency_buckets[i].name, name) == 0) {
+            VIRT_LatencyBucket *b = &g_latency_buckets[i];
+            if (b->count == 0) {
+                b->min_latency_ns = latency_ns;
+                b->max_latency_ns = latency_ns;
+            } else {
+                if (latency_ns < b->min_latency_ns) b->min_latency_ns = latency_ns;
+                if (latency_ns > b->max_latency_ns) b->max_latency_ns = latency_ns;
+            }
+            b->total_latency_ns += latency_ns;
+            b->count++;
+            int bucket_idx = virt_latency_find_bucket(b, latency_ns);
+            b->bucket_counts[bucket_idx]++;
+            return;
+        }
+    }
+}
+
+void virt_latency_dump(void) {
+    VIRT_LOGI("=== Latency Histogram ===");
+    for (size_t i = 0; i < g_latency_bucket_count; i++) {
+        VIRT_LatencyBucket *b = &g_latency_buckets[i];
+        if (b->count == 0) continue;
+        uint64_t avg = b->total_latency_ns / b->count;
+        VIRT_LOGI("%s: count=%llu, min=%llu, max=%llu, avg=%llu",
+                  b->name, (unsigned long long)b->count,
+                  (unsigned long long)b->min_latency_ns,
+                  (unsigned long long)b->max_latency_ns,
+                  (unsigned long long)avg);
+        for (int j = 0; j < VIRT_LATENCY_BUCKETS; j++) {
+            if (b->bucket_counts[j] > 0) {
+                VIRT_LOGI("  < %llu ns: %llu",
+                          (unsigned long long)b->bucket_limits[j],
+                          (unsigned long long)b->bucket_counts[j]);
+            }
+        }
+    }
+}
+
+// ---- Thread Monitor ----
 static uint32_t g_thread_monitor_count = 0;
 static VIRT_ThreadMonitor g_thread_monitors[VIRT_MAX_THREADS];
 static pthread_mutex_t g_thread_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -214,18 +359,23 @@ int virt_trie_lookup(const char *path, size_t path_len, int *out_action) {
 int virt_trie_build_default(void) {
     int rc = VIRT_OK;
     for (size_t i = 0; VIRT_DEFAULT_BLOCKED_PATTERNS[i] != NULL; i++) {
+        const char *pat = VIRT_DEFAULT_BLOCKED_PATTERNS[i];
+        int action = VIRT_ACTION_BLOCK_ENOENT;
         uint32_t prio = 100;
-        if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/proc/self/")) prio = 100;
-        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/su") ||
-                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/magisk") ||
-                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/data/adb") ||
-                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/sbin/"))
+        if (strstr(pat, "/proc/net/")) {
+            action = VIRT_ACTION_MONITOR;
+            prio = 50;
+        } else if (strstr(pat, "/proc/self/")) prio = 100;
+        else if (strstr(pat, "/su") ||
+                 strstr(pat, "/magisk") ||
+                 strstr(pat, "/data/adb") ||
+                 strstr(pat, "/sbin/"))
             prio = 200;
-        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "frida") ||
-                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "xposed") ||
-                 strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "substrate"))
+        else if (strstr(pat, "frida") ||
+                 strstr(pat, "xposed") ||
+                 strstr(pat, "substrate"))
             prio = 300;
-        rc = virt_trie_insert(VIRT_DEFAULT_BLOCKED_PATTERNS[i], VIRT_ACTION_BLOCK_ENOENT, prio);
+        rc = virt_trie_insert(pat, action, prio);
         if (rc < 0) break;
     }
     VIRT_LOGI("Trie built: %u nodes, %zu patterns", g_trie_node_count,
@@ -375,7 +525,7 @@ int virt_process_profile_detect(VIRT_ProcessProfileInfo *info) {
 }
 
 int virt_cache_flush(VIRT_CacheEntry *cache, uint32_t *cache_count) {
-    if (!cache || !cache_count) return VIRT_ERR_INVAL;
+    if (!cache || !cache_count) return VIRT_OK;
     memset(cache, 0, sizeof(VIRT_CacheEntry) * (*cache_count));
     *cache_count = 0;
     return VIRT_OK;
@@ -882,17 +1032,25 @@ int virt_rules_load_defaults(VIRT_Rule *rules, uint32_t *rule_count, uint32_t ma
     VIRT_Rule rule;
     for (size_t i = 0; VIRT_DEFAULT_BLOCKED_PATTERNS[i] != NULL && *rule_count < max_rules; i++) {
         memset(&rule, 0, sizeof(rule));
-        virt_safe_strncpy(rule.pattern, VIRT_DEFAULT_BLOCKED_PATTERNS[i], sizeof(rule.pattern));
-        rule.pattern_len = (uint32_t)strlen(VIRT_DEFAULT_BLOCKED_PATTERNS[i]);
-        rule.match_type = VIRT_MATCH_SUBSTRING; rule.action = VIRT_ACTION_BLOCK_ENOENT;
+        const char *pat = VIRT_DEFAULT_BLOCKED_PATTERNS[i];
+        virt_safe_strncpy(rule.pattern, pat, sizeof(rule.pattern));
+        rule.pattern_len = (uint32_t)strlen(pat);
+        rule.match_type = VIRT_MATCH_SUBSTRING;
         rule.scope = VIRT_SCOPE_ALL; rule.category = VIRT_CAT_PROC; rule.priority = 100;
         rule.enabled = true; rule.is_default = true; rule.is_system = true;
         rule.created_ns = virt_gettime_ns(); rule.hit_count = 0; rule.ref_count = 1;
-        if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/proc/")) rule.category = VIRT_CAT_PROC;
-        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/su") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/magisk") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/data/adb") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "/sbin/")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 200; }
-        else if (strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "xposed") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "frida") || strstr(VIRT_DEFAULT_BLOCKED_PATTERNS[i], "substrate")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 300; }
+        if (strstr(pat, "/proc/net/")) {
+            rule.action = VIRT_ACTION_MONITOR;
+            rule.category = VIRT_CAT_NETWORK;
+            rule.priority = 50;
+        } else {
+            rule.action = VIRT_ACTION_BLOCK_ENOENT;
+            if (strstr(pat, "/proc/")) rule.category = VIRT_CAT_PROC;
+            else if (strstr(pat, "/su") || strstr(pat, "/magisk") || strstr(pat, "/data/adb") || strstr(pat, "/sbin/")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 200; }
+            else if (strstr(pat, "xposed") || strstr(pat, "frida") || strstr(pat, "substrate")) { rule.category = VIRT_CAT_DEBUG; rule.priority = 300; }
+        }
         rules[*rule_count] = rule; (*rule_count)++;
-        virt_bloom_add(VIRT_DEFAULT_BLOCKED_PATTERNS[i]);
+        virt_bloom_add(pat);
     }
     VIRT_LOGI("Loaded %u default rules", *rule_count);
     return VIRT_OK;
@@ -1990,6 +2148,50 @@ static int virt_check_ld_preload(void) {
     return 0;
 }
 
+int virt_scan_sockets(VIRT_SocketInfo *sockets, int max_sockets) {
+    if (!sockets || max_sockets <= 0) return 0;
+    int count = 0;
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && count < max_sockets) {
+        if (de->d_name[0] == '.') continue;
+        int fd = atoi(de->d_name);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) < 0) continue;
+        if (!S_ISSOCK(st.st_mode)) continue;
+        sockets[count].fd = fd;
+        struct sockaddr_storage addr;
+        socklen_t addrlen = sizeof(addr);
+        if (getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0) {
+            if (addr.ss_family == AF_UNIX) {
+                struct sockaddr_un *un = (struct sockaddr_un *)&addr;
+                virt_safe_strncpy(sockets[count].name, un->sun_path, sizeof(sockets[count].name));
+            } else if (addr.ss_family == AF_INET) {
+                struct sockaddr_in *in = (struct sockaddr_in *)&addr;
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+                snprintf(sockets[count].name, sizeof(sockets[count].name),
+                         "tcp:%s:%u", ip, ntohs(in->sin_port));
+            } else if (addr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&addr;
+                char ip[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+                snprintf(sockets[count].name, sizeof(sockets[count].name),
+                         "tcp6:[%s]:%u", ip, ntohs(in6->sin6_port));
+            } else {
+                virt_safe_strncpy(sockets[count].name, "unknown", sizeof(sockets[count].name));
+            }
+        } else {
+            virt_safe_strncpy(sockets[count].name, "unix", sizeof(sockets[count].name));
+        }
+        count++;
+    }
+    closedir(d);
+    return count;
+}
+
 static int virt_check_suspicious_fds(void) {
     DIR *d = opendir("/proc/self/fd");
     if (!d) return 0;
@@ -2023,9 +2225,22 @@ int virt_anti_tamper_loop(void *arg) {
     virt_anti_tamper_init(&state);
 
     VIRT_LOGI("Anti-tamper loop started (interval=30s)");
+    uint64_t last_mem_check = 0;
+    int socket_suspicion = 0;
     while (1) {
         struct timespec ts = { .tv_sec = 30, .tv_nsec = 0 };
         nanosleep(&ts, NULL);
+
+        uint64_t now = virt_gettime_ns();
+        if (now - last_mem_check >= (60ULL * VIRT_NS_PER_SEC)) {
+            last_mem_check = now;
+            int pressure = virt_mem_check_pressure();
+            if (pressure > 0) {
+                virt_mem_reduce_footprint();
+            }
+            VIRT_LOGI("Memory stats: usage=%zu peak=%zu oom=%u",
+                      virt_mem_get_usage(), virt_mem_get_peak(), g_mem_stats.oom_count);
+        }
 
         int dbg = virt_anti_tamper_detect_debugger();
         int pt  = virt_anti_tamper_detect_ptrace();
@@ -2033,11 +2248,34 @@ int virt_anti_tamper_loop(void *arg) {
         int ld  = virt_check_ld_preload();
         int sfd = virt_check_suspicious_fds();
 
-        if (dbg > 0 || pt > 0 || hk > 0 || ld > 0 || sfd > 0) {
+        /* Socket scan for anti-cheat named sockets */
+        VIRT_SocketInfo sockets[32];
+        int num_sockets = virt_scan_sockets(sockets, 32);
+        int ac_sockets = 0;
+        static const char *ac_socket_patterns[] = {
+            "titanium", "dplugins", "xigncode",
+            "easyanticheat", "battleye", NULL
+        };
+        for (int si = 0; si < num_sockets; si++) {
+            for (int spi = 0; ac_socket_patterns[spi]; spi++) {
+                if (strstr(sockets[si].name, ac_socket_patterns[spi])) {
+                    VIRT_LOGW("Socket: fd=%d name=%s (anti-cheat)",
+                              sockets[si].fd, sockets[si].name);
+                    ac_sockets++;
+                    socket_suspicion++;
+                    break;
+                }
+            }
+        }
+        if (num_sockets > 0 && VIRT_LOG_LEVEL >= VIRT_LOG_LEVEL_DEBUG) {
+            VIRT_LOGD("Socket scan: %d total, %d anti-cheat", num_sockets, ac_sockets);
+        }
+
+        if (dbg > 0 || pt > 0 || hk > 0 || ld > 0 || sfd > 0 || ac_sockets > 0) {
             char warn[512];
             snprintf(warn, sizeof(warn),
-                     "Tamper: dbg=%d pt=%d hooks=%d ld_preload=%d susp_fds=%d",
-                     dbg, pt, hk, ld, sfd);
+                     "Tamper: dbg=%d pt=%d hooks=%d ld_preload=%d susp_fds=%d ac_sockets=%d (suspicion=%d)",
+                     dbg, pt, hk, ld, sfd, ac_sockets, socket_suspicion);
             VIRT_LOGW("%s", warn);
             virt_log_tamper_warning(warn);
         }
@@ -2305,6 +2543,91 @@ int virt_get_fake_stat(char *buf, size_t buf_size) {
     return (int)copy_len;
 }
 
+int virt_benchmark_run(int iterations) {
+    struct timespec start, end;
+    uint64_t total_ns;
+
+    VIRT_LOGI("Running benchmark: %d iterations", iterations);
+
+    // Benchmark 1: Trie lookup
+    int action;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < iterations; i++) {
+        virt_trie_lookup("/proc/self/maps", 14, &action);
+        virt_trie_lookup("/proc/self/status", 16, &action);
+        virt_trie_lookup("/system/build.prop", 19, &action);
+        virt_trie_lookup("/data/local/tmp/frida", 21, &action);
+        virt_trie_lookup("/sbin/su", 8, &action);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    total_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + (end.tv_nsec - start.tv_nsec);
+    VIRT_LOGI("Trie lookup: %llu ns for %d ops, avg %llu ns/op",
+              (unsigned long long)total_ns, iterations * 5,
+              (unsigned long long)(total_ns / (iterations * 5)));
+
+    // Benchmark 2: Path matching
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < iterations; i++) {
+        virt_path_match("/proc/self/maps", 14, "/proc/self/", VIRT_MATCH_PREFIX);
+        virt_path_match("/proc/self/maps", 14, "maps", VIRT_MATCH_SUFFIX);
+        virt_path_match("/proc/self/maps", 14, "/proc/self/maps", VIRT_MATCH_EXACT);
+        virt_path_match("/proc/self/maps", 14, "frida", VIRT_MATCH_SUBSTRING);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    total_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + (end.tv_nsec - start.tv_nsec);
+    VIRT_LOGI("Path matching: %llu ns for %d ops, avg %llu ns/op",
+              (unsigned long long)total_ns, iterations * 4,
+              (unsigned long long)(total_ns / (iterations * 4)));
+
+    // Benchmark 3: Cache operations
+    VIRT_CacheEntry bm_cache[64];
+    uint32_t bm_cache_count = 0;
+    memset(bm_cache, 0, sizeof(bm_cache));
+    virt_cache_insert(bm_cache, &bm_cache_count, 64, "/proc/self/maps", 14, true, VIRT_ACTION_BLOCK_ENOENT);
+    virt_cache_insert(bm_cache, &bm_cache_count, 64, "/proc/self/status", 16, true, VIRT_ACTION_BLOCK_ENOENT);
+    virt_cache_insert(bm_cache, &bm_cache_count, 64, "/system/build.prop", 19, false, VIRT_ACTION_ALLOW);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < iterations; i++) {
+        virt_cache_lookup(bm_cache, bm_cache_count, "/proc/self/maps", 14);
+        virt_cache_lookup(bm_cache, bm_cache_count, "/proc/self/status", 16);
+        virt_cache_lookup(bm_cache, bm_cache_count, "/system/build.prop", 19);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    total_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + (end.tv_nsec - start.tv_nsec);
+    VIRT_LOGI("Cache lookup: %llu ns for %d ops, avg %llu ns/op",
+              (unsigned long long)total_ns, iterations * 3,
+              (unsigned long long)(total_ns / (iterations * 3)));
+
+    // Benchmark 4: Bloom filter
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < iterations; i++) {
+        virt_bloom_check("/proc/self/maps", 14);
+        virt_bloom_check("/proc/self/status", 16);
+        virt_bloom_check("normal_path", 11);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    total_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + (end.tv_nsec - start.tv_nsec);
+    VIRT_LOGI("Bloom filter: %llu ns for %d ops, avg %llu ns/op",
+              (unsigned long long)total_ns, iterations * 3,
+              (unsigned long long)(total_ns / (iterations * 3)));
+
+    // Benchmark 5: Latency recording
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < iterations; i++) {
+        virt_latency_record("openat", 5000 + (i % 100) * 100);
+        virt_latency_record("connect", 10000 + (i % 50) * 200);
+        virt_latency_record("total", 15000 + (i % 20) * 500);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    total_ns = (end.tv_sec - start.tv_sec) * 1000000000ULL + (end.tv_nsec - start.tv_nsec);
+    VIRT_LOGI("Latency record: %llu ns for %d ops, avg %llu ns/op",
+              (unsigned long long)total_ns, iterations * 3,
+              (unsigned long long)(total_ns / (iterations * 3)));
+
+    VIRT_LOGI("Benchmark complete (%d iterations)", iterations);
+    return VIRT_OK;
+}
+
 int virt_run_self_test(void) {
     int passed = 0;
     int failed = 0;
@@ -2385,6 +2708,17 @@ int virt_run_self_test(void) {
         passed++;
     }
 
+    /* Test 6: Benchmark */
+    {
+        if (virt_benchmark_run(100) != VIRT_OK) {
+            VIRT_LOGE("  FAIL: benchmark");
+            failed++;
+        } else {
+            VIRT_LOGI("  PASS: benchmark (100 iterations)");
+            passed++;
+        }
+    }
+
     VIRT_LOGI("Self-test: %d passed, %d failed", passed, failed);
     return failed;
 }
@@ -2409,4 +2743,71 @@ int virt_is_selinux_enforcing(void) {
     if (n <= 0) return -1;
     buf[n] = '\0';
     return (buf[0] == '1') ? 1 : 0;
+}
+
+int virt_get_fake_proc_version(char *buf, size_t buf_size) {
+    const char *fake = "Linux version 5.10.149-android13-4-00001-gdeadbeef (build-user@build-host) "
+                       "(Android (version) clang version 16.0.2) "
+                       "#1 SMP PREEMPT Thu Jan 1 00:00:00 UTC 2024\n";
+    size_t len = strlen(fake);
+    size_t copy = VIRT_MIN(len, buf_size - 1);
+    memcpy(buf, fake, copy);
+    buf[copy] = '\0';
+    return (int)copy;
+}
+
+int virt_get_fake_boot_id(char *buf, size_t buf_size) {
+    const char *id = "deadbeef-cafe-babe-0123-456789abcdef\n";
+    size_t len = strlen(id);
+    size_t copy = VIRT_MIN(len, buf_size - 1);
+    memcpy(buf, id, copy);
+    buf[copy] = '\0';
+    return (int)copy;
+}
+
+int virt_get_fake_cpuinfo(char *buf, size_t buf_size) {
+    const char *fake =
+        "Processor\t: AArch64 Processor rev 14 (aarch64)\n"
+        "processor\t: 0\n"
+        "BogoMIPS\t: 38.40\n"
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs\n"
+        "CPU implementer\t: 0x51\n"
+        "CPU architecture\t: 8\n"
+        "CPU variant\t: 0x2\n"
+        "CPU part\t: 0x801\n"
+        "CPU revision\t: 14\n"
+        "\n"
+        "processor\t: 1\n"
+        "BogoMIPS\t: 38.40\n"
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs\n"
+        "CPU implementer\t: 0x51\n"
+        "CPU architecture\t: 8\n"
+        "CPU variant\t: 0x2\n"
+        "CPU part\t: 0x801\n"
+        "CPU revision\t: 14\n"
+        "\n"
+        "processor\t: 2\n"
+        "BogoMIPS\t: 38.40\n"
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs\n"
+        "CPU implementer\t: 0x51\n"
+        "CPU architecture\t: 8\n"
+        "CPU variant\t: 0x2\n"
+        "CPU part\t: 0x801\n"
+        "CPU revision\t: 14\n"
+        "\n"
+        "processor\t: 3\n"
+        "BogoMIPS\t: 38.40\n"
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp simdhp cpuid asimdrdb lrcpc dcpop asimddp ssbs\n"
+        "CPU implementer\t: 0x51\n"
+        "CPU architecture\t: 8\n"
+        "CPU variant\t: 0x2\n"
+        "CPU part\t: 0x801\n"
+        "CPU revision\t: 14\n"
+        "\n"
+        "Hardware\t: Qualcomm Technologies, Inc SM8550\n";
+    size_t len = strlen(fake);
+    size_t copy = VIRT_MIN(len, buf_size - 1);
+    memcpy(buf, fake, copy);
+    buf[copy] = '\0';
+    return (int)copy;
 }

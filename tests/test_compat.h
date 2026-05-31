@@ -37,6 +37,9 @@ typedef int64_t  __s64;
 
 #endif // __KERNEL__
 
+// Provide sys/un.h for sockaddr_un (used by virtualizer_core.cpp)
+#include <sys/un.h>
+
 // Stub linux/audit.h
 #ifndef AUDIT_ARCH_AARCH64
 #define AUDIT_ARCH_AARCH64 (183 | 0x40000000)
