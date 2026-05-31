@@ -18,7 +18,7 @@ static void test_add_and_count() {
     VIRT_Rule rule;
     memset(&rule, 0, sizeof(rule));
     virt_safe_strncpy(rule.pattern, "/proc/self/maps", sizeof(rule.pattern));
-    rule.pattern_len = 14;
+    rule.pattern_len = 15;
     rule.action = VIRT_ACTION_BLOCK_ENOENT;
     rule.priority = 100;
     rule.enabled = true;
@@ -51,7 +51,7 @@ static void test_lookup() {
     VIRT_Rule rule;
     memset(&rule, 0, sizeof(rule));
     virt_safe_strncpy(rule.pattern, "/proc/self/maps", sizeof(rule.pattern));
-    rule.pattern_len = 14;
+    rule.pattern_len = 15;
     rule.action = VIRT_ACTION_BLOCK_ENOENT;
     rule.match_type = VIRT_MATCH_SUBSTRING;
     rule.priority = 100;
@@ -70,7 +70,7 @@ static void test_lookup() {
     virt_rules_add(g_rules, &g_rule_count, 512, &rule);
 
     int action;
-    int rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 14, &action);
+    int rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 15, &action);
     if (rc < 0 || action != VIRT_ACTION_BLOCK_ENOENT) {
         printf("FAIL: rules lookup /proc/self/maps (rc=%d, action=%d)\n", rc, action);
         failures++;
@@ -101,7 +101,7 @@ static void test_disabled_rule() {
     VIRT_Rule rule;
     memset(&rule, 0, sizeof(rule));
     virt_safe_strncpy(rule.pattern, "/proc/self/maps", sizeof(rule.pattern));
-    rule.pattern_len = 14;
+    rule.pattern_len = 15;
     rule.action = VIRT_ACTION_BLOCK_ENOENT;
     rule.match_type = VIRT_MATCH_SUBSTRING;
     rule.priority = 100;
@@ -110,7 +110,7 @@ static void test_disabled_rule() {
     virt_rules_add(g_rules, &g_rule_count, 512, &rule);
 
     int action;
-    int rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 14, &action);
+    int rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 15, &action);
     if (rc >= 0) {
         printf("FAIL: disabled rule should not match\n");
         failures++;
@@ -142,7 +142,7 @@ static void test_priority_ordering() {
 
     memset(&rule, 0, sizeof(rule));
     virt_safe_strncpy(rule.pattern, "/proc/self/maps", sizeof(rule.pattern));
-    rule.pattern_len = 14;
+    rule.pattern_len = 15;
     rule.action = VIRT_ACTION_BLOCK_ENOENT;
     rule.match_type = VIRT_MATCH_PREFIX;
     rule.priority = 200;
@@ -152,7 +152,7 @@ static void test_priority_ordering() {
     virt_rules_sort(g_rules, g_rule_count);
 
     int action;
-    virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 14, &action);
+    virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 15, &action);
     if (action != VIRT_ACTION_BLOCK_ENOENT) {
         printf("FAIL: higher priority rule should win (action=%d)\n", action);
         failures++;
@@ -314,6 +314,123 @@ static void test_invalid_args() {
     }
 }
 
+static void test_exact_match_rule() {
+    reset_rules();
+
+    VIRT_Rule rule;
+    memset(&rule, 0, sizeof(rule));
+    virt_safe_strncpy(rule.pattern, "/proc/self/maps", sizeof(rule.pattern));
+    rule.pattern_len = 15;
+    rule.action = VIRT_ACTION_BLOCK_ENOENT;
+    rule.match_type = VIRT_MATCH_EXACT;
+    rule.priority = 100;
+    rule.enabled = true;
+    rule.category = VIRT_CAT_PROC;
+    virt_rules_add(g_rules, &g_rule_count, 512, &rule);
+
+    int action;
+    int rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps", 15, &action);
+    if (rc < 0 || action != VIRT_ACTION_BLOCK_ENOENT) {
+        printf("FAIL: exact match lookup (rc=%d, action=%d)\n", rc, action);
+        failures++;
+    }
+
+    // Slightly longer path should not match
+    rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/maps/extra", 21, &action);
+    if (rc >= 0) {
+        printf("FAIL: exact match should not match longer path\n");
+        failures++;
+    }
+
+    printf("PASS: exact match rule\n");
+}
+
+static void test_prefix_match_rule() {
+    reset_rules();
+
+    VIRT_Rule rule;
+    memset(&rule, 0, sizeof(rule));
+    virt_safe_strncpy(rule.pattern, "/proc/self/", sizeof(rule.pattern));
+    rule.pattern_len = 11;
+    rule.action = VIRT_ACTION_FAKE_CONTENT;
+    rule.match_type = VIRT_MATCH_PREFIX;
+    rule.priority = 100;
+    rule.enabled = true;
+    virt_rules_add(g_rules, &g_rule_count, 512, &rule);
+
+    int action;
+    int rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/self/status", 17, &action);
+    if (rc < 0 || action != VIRT_ACTION_FAKE_CONTENT) {
+        printf("FAIL: prefix match should match subpath (rc=%d, action=%d)\n", rc, action);
+        failures++;
+    }
+
+    rc = virt_rules_lookup(g_rules, g_rule_count, "/proc/version", 13, &action);
+    if (rc >= 0) {
+        printf("FAIL: prefix match should not match different path\n");
+        failures++;
+    }
+
+    printf("PASS: prefix match rule\n");
+}
+
+static void test_suffix_match_rule() {
+    reset_rules();
+
+    VIRT_Rule rule;
+    memset(&rule, 0, sizeof(rule));
+    virt_safe_strncpy(rule.pattern, "magisk", sizeof(rule.pattern));
+    rule.pattern_len = 6;
+    rule.action = VIRT_ACTION_BLOCK_ENOENT;
+    rule.match_type = VIRT_MATCH_SUFFIX;
+    rule.priority = 100;
+    rule.enabled = true;
+    virt_rules_add(g_rules, &g_rule_count, 512, &rule);
+
+    int action;
+    int rc = virt_rules_lookup(g_rules, g_rule_count, "/sbin/magisk", 12, &action);
+    if (rc < 0 || action != VIRT_ACTION_BLOCK_ENOENT) {
+        printf("FAIL: suffix match should match ending (rc=%d)\n", rc);
+        failures++;
+    }
+
+    rc = virt_rules_lookup(g_rules, g_rule_count, "/sbin/magiskd", 13, &action);
+    if (rc >= 0) {
+        printf("FAIL: suffix should not match longer tail\n");
+        failures++;
+    }
+
+    printf("PASS: suffix match rule\n");
+}
+
+static void test_disabled_not_counted() {
+    reset_rules();
+
+    VIRT_Rule rule;
+    memset(&rule, 0, sizeof(rule));
+    virt_safe_strncpy(rule.pattern, "/proc", sizeof(rule.pattern));
+    rule.action = VIRT_ACTION_BLOCK_ENOENT;
+    rule.enabled = true;
+    rule.category = VIRT_CAT_PROC;
+    virt_rules_add(g_rules, &g_rule_count, 512, &rule);
+
+    memset(&rule, 0, sizeof(rule));
+    virt_safe_strncpy(rule.pattern, "frida", sizeof(rule.pattern));
+    rule.action = VIRT_ACTION_BLOCK_ENOENT;
+    rule.enabled = false; // disabled
+    rule.category = VIRT_CAT_DEBUG;
+    virt_rules_add(g_rules, &g_rule_count, 512, &rule);
+
+    // Count by action should only count enabled
+    int cnt = virt_rules_count_by_action(g_rules, g_rule_count, VIRT_ACTION_BLOCK_ENOENT);
+    if (cnt != 1) {
+        printf("FAIL: count by action should exclude disabled (got %d)\n", cnt);
+        failures++;
+    }
+
+    printf("PASS: disabled rules excluded from count\n");
+}
+
 int main() {
     printf("=== Rules Unit Tests ===\n\n");
 
@@ -327,6 +444,10 @@ int main() {
     test_load_defaults();
     test_overwrite_with_priority();
     test_invalid_args();
+    test_exact_match_rule();
+    test_prefix_match_rule();
+    test_suffix_match_rule();
+    test_disabled_not_counted();
 
     printf("\n%d tests failed\n", failures);
     return failures;

@@ -686,7 +686,6 @@ enum VIRT_SYSCALL_NR : int {
     VIRT_NR_uname           = 160,
     VIRT_NR_clone3          = 435,
     VIRT_NR_exit_group      = 94,
-    VIRT_NR_getdents        = 78,
     VIRT_NR_clone           = 220,
     VIRT_NR_fstatfs         = 44,
     VIRT_NR_statfs          = 43,

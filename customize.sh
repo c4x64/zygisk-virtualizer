@@ -51,6 +51,7 @@ fi
 if [ -d "$MODPATH/webui" ]; then
     if [ "$ENVIRONMENT" = "KernelSU" ]; then
         ui_print "- WebUI support enabled"
+        ui_print "- WebUI available in KernelSU/APatch app"
     else
         ui_print "- Removing WebUI (Magisk/APatch - not supported)"
         rm -rf "$MODPATH/webui"

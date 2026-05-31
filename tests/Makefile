@@ -13,16 +13,12 @@
 #       -std=c++17 -o test_trie test_trie.cpp ../../virtualizer_core.cpp
 
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -Wno-psabi -Wno-unused-parameter -g -O0 \
+CXXFLAGS = -std=c++17 -Wall -Wextra -Wno-psabi -Wno-unused-parameter \
+           -Wno-deprecated-declarations -g -O0 \
            -I. -I../.. -Iandroid -I. \
            -DVIRT_LOG_LEVEL=0 \
            -D__ANDROID_API__=30 \
            -include test_compat.h
-
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-CXXFLAGS += -include test_compat.h
-endif
 
 SRCDIR := unit
 CORE := ../virtualizer_core.cpp
@@ -30,23 +26,25 @@ CORE := ../virtualizer_core.cpp
 all: $(SRCDIR)/test_trie $(SRCDIR)/test_cache $(SRCDIR)/test_rules \
      $(SRCDIR)/test_config $(SRCDIR)/test_proc_hider $(SRCDIR)/test_stats
 
-$(SRCDIR)/test_trie: $(SRCDIR)/test_trie.cpp $(CORE) ../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+STUBS := test_stubs.cpp
 
-$(SRCDIR)/test_cache: $(SRCDIR)/test_cache.cpp $(CORE) ../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+$(SRCDIR)/test_trie: $(SRCDIR)/test_trie.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
 
-$(SRCDIR)/test_rules: $(SRCDIR)/test_rules.cpp $(CORE) ../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+$(SRCDIR)/test_cache: $(SRCDIR)/test_cache.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
 
-$(SRCDIR)/test_config: $(SRCDIR)/test_config.cpp $(CORE) ../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+$(SRCDIR)/test_rules: $(SRCDIR)/test_rules.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
 
-$(SRCDIR)/test_proc_hider: $(SRCDIR)/test_proc_hider.cpp $(CORE) ../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+$(SRCDIR)/test_config: $(SRCDIR)/test_config.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
 
-$(SRCDIR)/test_stats: $(SRCDIR)/test_stats.cpp $(CORE) ../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+$(SRCDIR)/test_proc_hider: $(SRCDIR)/test_proc_hider.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
+
+$(SRCDIR)/test_stats: $(SRCDIR)/test_stats.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
 
 clean:
 	rm -f $(SRCDIR)/test_trie $(SRCDIR)/test_cache $(SRCDIR)/test_rules \

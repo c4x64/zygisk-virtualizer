@@ -48,9 +48,12 @@ static uint32_t virt_bloom_hash2(const char *str, uint32_t len) {
 // Add a pattern string to the bloom filter.
 // @param pattern - non-null string to add
 void virt_bloom_add(const char *pattern) {
+    assert(pattern != NULL);
     uint32_t len = strlen(pattern);
     uint32_t h1 = virt_bloom_hash1(pattern, len);
     uint32_t h2 = virt_bloom_hash2(pattern, len);
+    assert(h1 / 64 < VIRT_BLOOM_SIZE / 64);
+    assert(h2 / 64 < VIRT_BLOOM_SIZE / 64);
     g_bloom_filter[h1 / 64] |= (1ULL << (h1 % 64));
     g_bloom_filter[h2 / 64] |= (1ULL << (h2 % 64));
 }
@@ -124,6 +127,9 @@ static void trie_node_free_recursive(TrieNode *node) {
 int virt_trie_insert(const char *path, int action, uint32_t priority) {
     if (!path || !path[0]) { VIRT_INC_ERR(VIRT_ERR_INVAL); return VIRT_ERR_INVAL; }
 
+    size_t len = strlen(path);
+    if (len >= VIRT_PATH_BUF_SIZE) { VIRT_INC_ERR(VIRT_ERR_INVAL); return VIRT_ERR_INVAL; }
+
     pthread_mutex_lock(&g_trie_lock);
 
     if (!g_trie_root) {
@@ -132,7 +138,6 @@ int virt_trie_insert(const char *path, int action, uint32_t priority) {
     }
 
     TrieNode *node = g_trie_root;
-    size_t len = strlen(path);
 
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)path[i];
@@ -171,7 +176,7 @@ int virt_trie_insert(const char *path, int action, uint32_t priority) {
 // @return VIRT_OK on match, VIRT_ERR_NOENT on no match, VIRT_ERR_INVAL on bad args
 int virt_trie_lookup(const char *path, size_t path_len, int *out_action) {
     if (!path || !out_action) return VIRT_ERR_INVAL;
-    assert(path_len > 0);
+    if (path_len == 0) return VIRT_ERR_INVAL;
     *out_action = VIRT_ACTION_PASS_THROUGH;
 
     __sync_fetch_and_add(&g_trie_total_lookups, 1);
@@ -766,7 +771,7 @@ int virt_stats_snapshot(const VIRT_SyscallStats *stats, char *buf, size_t buf_si
 // @return cached action on hit, VIRT_ERR_NOENT on miss, VIRT_ERR_INVAL on bad args
 int virt_cache_lookup(VIRT_CacheEntry *cache, uint32_t cache_count, const char *path, uint32_t path_len) {
     if (!cache || !path || !path_len) return VIRT_ERR_INVAL;
-    assert(path_len <= VIRT_PATH_BUF_SIZE);
+    if (path_len > VIRT_PATH_BUF_SIZE) return VIRT_ERR_INVAL;
     uint64_t now = virt_gettime_ns();
     for (uint32_t i = 0; i < cache_count; i++) {
         if (!cache[i].valid) continue;
@@ -789,8 +794,7 @@ int virt_cache_lookup(VIRT_CacheEntry *cache, uint32_t cache_count, const char *
 // @param action - action to cache
 // @return VIRT_OK on success
 int virt_cache_insert(VIRT_CacheEntry *cache, uint32_t *cache_count, uint32_t cache_max, const char *path, uint32_t path_len, bool sensitive, int action) {
-    if (!cache || !cache_count || !path || !path_len) return VIRT_ERR_INVAL;
-    assert(cache_max > 0);
+    if (!cache || !cache_count || !path || !path_len || cache_max == 0) return VIRT_ERR_INVAL;
     uint32_t idx;
     if (*cache_count < cache_max) { idx = (*cache_count)++; }
     else {
@@ -944,6 +948,11 @@ int virt_proc_hider_add_pid(VIRT_ProcHiderState *state, pid_t pid) {
     return VIRT_OK;
 }
 
+// Check if the given path refers to a hidden fd under /proc/*/fd/.
+// @param state - proc hider state (non-null)
+// @param path - path string (non-null)
+// @param path_len - length of path
+// @return 1 if path refers to a hidden fd, 0 otherwise
 int virt_proc_hider_check_fd_path(VIRT_ProcHiderState *state,
                                    const char *path, uint32_t path_len) {
     if (!state || !path || !path_len) return 0;
@@ -1135,9 +1144,9 @@ int virt_config_load(const char *path, VIRT_Config *cfg) {
         }
     }
     if (!f) return VIRT_OK;
-    char line[1024]; int ln = 0;
+    char line[1024];
     while (fgets(line, sizeof(line), f)) {
-        ln++; char *p = line; while (*p == ' ' || *p == '\t') p++;
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '\0') continue;
         char *eq = strchr(p, '='); if (!eq) continue;
         *eq = '\0'; char *key = p; char *val = eq + 1;
@@ -1179,7 +1188,7 @@ int virt_config_load(const char *path, VIRT_Config *cfg) {
         else if (!strcmp(key, "enable_file_decoy")) set_bool(&cfg->enable_file_decoy);
         else if (!strcmp(key, "fake_maps_path")) virt_safe_strncpy(cfg->fake_maps_path, val, sizeof(cfg->fake_maps_path));
         else if (!strcmp(key, "fake_status_path")) virt_safe_strncpy(cfg->fake_status_path, val, sizeof(cfg->fake_status_path));
-        else if (!strcmp(key, "rules_json_path")) virt_safe_strncpy(cfg->rules_path, val, sizeof(cfg->rules_path));
+        else if (!strcmp(key, "rules_json_path")) virt_safe_strncpy(cfg->rules_json_path, val, sizeof(cfg->rules_json_path));
         else if (!strcmp(key, "config_path")) virt_safe_strncpy(cfg->config_path, val, sizeof(cfg->config_path));
         else if (!strcmp(key, "rules_path")) virt_safe_strncpy(cfg->rules_path, val, sizeof(cfg->rules_path));
         else if (!strcmp(key, "log_tag")) virt_safe_strncpy(cfg->log_tag, val, sizeof(cfg->log_tag));
@@ -1502,7 +1511,7 @@ static int json_parse_string(const char **p, char *out, size_t out_size) {
     (*p)++;
     size_t i = 0;
     while (**p && **p != '"' && i + 1 < out_size) {
-        if (**p == '\\' && *(p[0] + 1)) {
+        if (**p == '\\' && *(*p + 1)) {
             (*p)++;
             switch (**p) {
                 case '"': out[i++] = '"'; break;

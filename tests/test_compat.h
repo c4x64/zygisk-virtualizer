@@ -37,34 +37,6 @@ typedef int64_t  __s64;
 
 #endif // __KERNEL__
 
-// Stub Linux-specific ioctl / seccomp types
-// Only define if NDK headers are not present
-#ifndef _LINUX_SECCOMP_H
-#define _LINUX_SECCOMP_H 1
-struct seccomp_data { int nr; __u32 arch; __u64 instruction_pointer; __u64 args[6]; };
-struct seccomp_notif { __u64 id; __u32 pid; __u32 flags; struct seccomp_data data; };
-struct seccomp_notif_resp { __u64 id; __s64 val; __s32 error; __u32 flags; };
-#endif
-
-#ifndef SECCOMP_SET_MODE_FILTER
-#define SECCOMP_SET_MODE_FILTER 1
-#endif
-
-#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
-#define SECCOMP_FILTER_FLAG_NEW_LISTENER 0x20
-#endif
-
-#ifndef SECCOMP_RET_USER_NOTIF
-#define SECCOMP_RET_USER_NOTIF 0x7fc00000
-#endif
-
-#ifndef SECCOMP_IOCTL_NOTIF_RECV
-#define SECCOMP_IOC_MAGIC '!'
-#define SECCOMP_IOCTL_NOTIF_RECV 0
-#define SECCOMP_IOCTL_NOTIF_SEND 1
-#define SECCOMP_IOCTL_NOTIF_ID_VALID 2
-#endif
-
 // Stub linux/audit.h
 #ifndef AUDIT_ARCH_AARCH64
 #define AUDIT_ARCH_AARCH64 (183 | 0x40000000)
@@ -79,10 +51,7 @@ struct seccomp_notif_resp { __u64 id; __s64 val; __s32 error; __u32 flags; };
 #define EM_X86_64 62
 #endif
 
-// Stub linux/filter.h
-struct sock_filter { __u16 code; __u8 jt; __u8 jf; __u32 k; };
-struct sock_fprog { unsigned short len; struct sock_filter *filter; };
-
+// Stub linux/filter.h (only if not already defined by our linux/filter.h stub)
 #ifndef BPF_LD
 #define BPF_LD 0x00
 #endif
@@ -111,28 +80,12 @@ struct sock_fprog { unsigned short len; struct sock_filter *filter; };
 #define BPF_AND 0x50
 #endif
 
-// Stub linux/unistd.h
-#ifndef __NR_seccomp
-#define __NR_seccomp 277
-#endif
-
 // Stub syscall if not on Linux
-#ifndef __NR_getdents64
-#define __NR_getdents64 61
-#endif
-
 #ifndef SYS_getcpu
 #define SYS_getcpu 168
 #endif
 
-// Stub eventfd and timerfd
-#ifndef EFD_NONBLOCK
-#define EFD_NONBLOCK 0x800
-#endif
 
-#ifndef TFD_NONBLOCK
-#define TFD_NONBLOCK 0x800
-#endif
 
 // arpa/inet.h stubs for macOS compatibility with Linux headers
 #ifndef AF_UNIX

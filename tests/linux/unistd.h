@@ -10,7 +10,7 @@
 #define __NR_newfstatat 79
 #define __NR_statx 291
 #define __NR_getdents64 61
-#define __NR_getdents 78
+/* __NR_getdents intentionally omitted — not defined on ARM64 and conflicts with __NR_readlinkat (78) */
 #define __NR_connect 203
 #define __NR_socket 198
 #define __NR_ioctl 29

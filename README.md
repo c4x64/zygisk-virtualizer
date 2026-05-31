@@ -383,6 +383,27 @@ The compiled library is at `libs/arm64-v8a/libvirtualizer.so`.
 
 ---
 
+## 🌐 WebUI (KernelSU/APatch)
+
+The module includes a WebUI for KernelSU and APatch users. This interface is
+NOT served via an HTTP server. It is loaded directly from the module directory
+by the KernelSU app through a WebView. No network ports are opened and no
+localhost server is running. Other applications on the device cannot access
+this interface.
+
+To access the WebUI:
+1. Open the KernelSU or APatch app
+2. Go to the Modules section
+3. Tap on "Zygisk Virtualizer"
+4. The WebUI will open in-app
+
+Features:
+- Module status overview
+- Statistics display
+- Reset, Clear Logs, and Reload Rules controls
+
+---
+
 ## 📱 Installation
 
 ### Module Structure

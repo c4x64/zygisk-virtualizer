@@ -16,7 +16,7 @@ static void test_insert_and_lookup() {
     reset_cache();
 
     int rc = virt_cache_insert(g_cache, &g_cache_count, 128,
-                               "/proc/self/maps", 14, true, VIRT_ACTION_BLOCK_ENOENT);
+                               "/proc/self/maps", 15, true, VIRT_ACTION_BLOCK_ENOENT);
     if (rc < 0) {
         printf("FAIL: cache insert rc=%d\n", rc);
         failures++;
@@ -28,7 +28,7 @@ static void test_insert_and_lookup() {
         return;
     }
 
-    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 14);
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 15);
     if (cached != VIRT_ACTION_BLOCK_ENOENT) {
         printf("FAIL: cache lookup expected BLOCK_ENOENT, got %d\n", cached);
         failures++;
@@ -41,7 +41,7 @@ static void test_cache_miss() {
     reset_cache();
 
     virt_cache_insert(g_cache, &g_cache_count, 128,
-                      "/proc/self/maps", 14, true, VIRT_ACTION_BLOCK_ENOENT);
+                      "/proc/self/maps", 15, true, VIRT_ACTION_BLOCK_ENOENT);
 
     int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/status", 17);
     if (cached >= 0) {
@@ -56,9 +56,9 @@ static void test_non_sensitive_entry() {
     reset_cache();
 
     virt_cache_insert(g_cache, &g_cache_count, 128,
-                      "/proc/self/maps", 14, false, VIRT_ACTION_BLOCK_ENOENT);
+                      "/proc/self/maps", 15, false, VIRT_ACTION_BLOCK_ENOENT);
 
-    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 14);
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 15);
     if (cached != VIRT_ACTION_PASS_THROUGH) {
         printf("FAIL: non-sensitive cache should return PASS_THROUGH, got %d\n", cached);
         failures++;
@@ -83,7 +83,7 @@ static void test_cache_eviction() {
         return;
     }
 
-    int cached = virt_cache_lookup(g_cache, g_cache_count, "/test/path/0", 11);
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "/test/path/0", 12);
     if (cached >= 0) {
         printf("FAIL: evicted entry should not be found\n");
         failures++;
@@ -96,7 +96,7 @@ static void test_invalidate() {
     reset_cache();
 
     virt_cache_insert(g_cache, &g_cache_count, 128,
-                      "/proc/self/maps", 14, true, VIRT_ACTION_BLOCK_ENOENT);
+                      "/proc/self/maps", 15, true, VIRT_ACTION_BLOCK_ENOENT);
 
     int rc = virt_cache_invalidate(g_cache, &g_cache_count, "/proc/self/maps");
     if (rc < 0) {
@@ -105,7 +105,7 @@ static void test_invalidate() {
         return;
     }
 
-    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 14);
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 15);
     if (cached >= 0) {
         printf("FAIL: invalidated cache entry should not be found\n");
         failures++;
@@ -118,7 +118,7 @@ static void test_flush() {
     reset_cache();
 
     virt_cache_insert(g_cache, &g_cache_count, 128,
-                      "/proc/self/maps", 14, true, VIRT_ACTION_BLOCK_ENOENT);
+                      "/proc/self/maps", 15, true, VIRT_ACTION_BLOCK_ENOENT);
     virt_cache_insert(g_cache, &g_cache_count, 128,
                       "/proc/self/status", 17, true, VIRT_ACTION_FAKE_CONTENT);
 
@@ -175,6 +175,105 @@ static void test_invalid_args() {
     }
 }
 
+static void test_cache_insert_null_path() {
+    reset_cache();
+
+    int rc = virt_cache_insert(g_cache, &g_cache_count, 128,
+                               NULL, 5, true, VIRT_ACTION_BLOCK_ENOENT);
+    if (rc >= 0) {
+        printf("FAIL: cache insert NULL path should fail\n");
+        failures++;
+    } else {
+        printf("PASS: cache insert NULL path fails\n");
+    }
+}
+
+static void test_cache_insert_zero_len() {
+    reset_cache();
+
+    int rc = virt_cache_insert(g_cache, &g_cache_count, 128,
+                               "", 0, true, VIRT_ACTION_BLOCK_ENOENT);
+    if (rc >= 0) {
+        printf("FAIL: cache insert zero-length path should fail\n");
+        failures++;
+    } else {
+        printf("PASS: cache insert zero-length path fails\n");
+    }
+}
+
+static void test_cache_lookup_zero_len() {
+    reset_cache();
+
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "", 0);
+    if (cached >= 0) {
+        printf("FAIL: cache lookup zero-length path should fail\n");
+        failures++;
+    } else {
+        printf("PASS: cache lookup zero-length path fails\n");
+    }
+}
+
+static void test_cache_multiple_inserts_same_path() {
+    reset_cache();
+
+    virt_cache_insert(g_cache, &g_cache_count, 128,
+                      "/proc/self/maps", 15, true, VIRT_ACTION_BLOCK_ENOENT);
+    virt_cache_insert(g_cache, &g_cache_count, 128,
+                      "/proc/self/maps", 15, true, VIRT_ACTION_FAKE_CONTENT);
+
+    // Cache does not deduplicate — both entries exist; lookup finds first (BLOCK_ENOENT)
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "/proc/self/maps", 15);
+    if (cached < 0) {
+        printf("FAIL: duplicate insert should still be findable (got %d)\n", cached);
+        failures++;
+    }
+    if (g_cache_count != 2) {
+        printf("FAIL: duplicate insert should increase count (%u)\n", g_cache_count);
+        failures++;
+    }
+
+    printf("PASS: cache multiple inserts same path (%u entries)\n", g_cache_count);
+}
+
+static void test_cache_exact_max() {
+    reset_cache();
+
+    for (uint32_t i = 0; i < 5; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/test/path/%u", i);
+        virt_cache_insert(g_cache, &g_cache_count, 5,
+                          path, (uint32_t)strlen(path), true, VIRT_ACTION_BLOCK_ENOENT);
+    }
+
+    if (g_cache_count != 5) {
+        printf("FAIL: expected 5 entries after filling, got %u\n", g_cache_count);
+        failures++;
+        return;
+    }
+
+    // Look up the most recently added entry (should not be evicted)
+    int cached = virt_cache_lookup(g_cache, g_cache_count, "/test/path/4", 12);
+    if (cached < 0) {
+        printf("FAIL: recently added entry should be found\n");
+        failures++;
+    }
+
+    printf("PASS: cache exact max\n");
+}
+
+static void test_cache_zero_max() {
+    reset_cache();
+
+    int rc = virt_cache_insert(g_cache, &g_cache_count, 0,
+                               "/test", 5, true, VIRT_ACTION_BLOCK_ENOENT);
+    if (rc >= 0) {
+        printf("FAIL: insert with max=0 should fail\n");
+        failures++;
+    } else {
+        printf("PASS: cache insert with max=0 fails\n");
+    }
+}
+
 int main() {
     printf("=== Cache Unit Tests ===\n\n");
 
@@ -185,6 +284,12 @@ int main() {
     test_invalidate();
     test_flush();
     test_invalid_args();
+    test_cache_insert_null_path();
+    test_cache_insert_zero_len();
+    test_cache_lookup_zero_len();
+    test_cache_multiple_inserts_same_path();
+    test_cache_exact_max();
+    test_cache_zero_max();
 
     printf("\n%d tests failed\n", failures);
     return failures;

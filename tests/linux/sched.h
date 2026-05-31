@@ -1,0 +1,11 @@
+#pragma once
+
+#include <stdint.h>
+
+#define CLONE_VM 0x100
+#define CLONE_VFORK 0x4000
+#define CLONE_VFORK 0x4000
+#define CLONE_CHILD_SETTID 0x01000000
+#define CLONE_CHILD_CLEARTID 0x02000000
+#define CLONE_PARENT_SETTID 0x00100000
+#define CLONE_SETTLS 0x00080000

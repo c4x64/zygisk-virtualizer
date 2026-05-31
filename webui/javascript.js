@@ -1,3 +1,11 @@
+// Security: This UI is loaded from local filesystem by KernelSU app.
+// There is no HTTP server running. If someone somehow loaded this
+// from a web server context, refuse to run.
+if (window.location.protocol !== 'file:' && window.location.protocol !== 'about:') {
+    document.body.innerHTML = '<h1>Access Denied</h1><p>This interface is only available through the KernelSU app.</p>';
+    throw new Error('WebUI loaded from invalid context');
+}
+
 (function () {
   const BASE = '/data/local/tmp/virtualizer';
   const STATS_FILE = BASE + '/stats.json';
