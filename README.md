@@ -690,21 +690,6 @@ The first process with UID=0 creates the marker file and is identified as the re
 
 ## 🧪 Testing
 
-### Test Device Setup
-
-The project is tested on **BlueStacks Tiramisu64** (Android 13, ARM64) with Magisk v27+:
-
-```sh
-# Connect ADB
-adb connect 127.0.0.1:5555
-
-# Build and deploy
-NDK_PROJECT_PATH=$PWD $NDK/ndk-build NDK_DEBUG=0
-./package.sh && adb push /tmp/zygisk-virtualizer-v1.0.0.zip /data/local/tmp/
-adb shell su -c 'magisk --install-module /data/local/tmp/zygisk-virtualizer-v1.0.0.zip'
-adb reboot
-```
-
 ### Monitoring Logs
 
 ```sh
@@ -776,8 +761,7 @@ adb reboot
 3. Delete `zygisk-virtualizer/`
 4. Reboot
 
-**Method 3 — Factory Reset (BlueStacks):**
-If ADB is unavailable, uninstall and reinstall the BlueStacks instance from Multi-Instance Manager.
+
 
 ---
 
