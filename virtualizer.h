@@ -1554,7 +1554,7 @@ static const VIRT_Config VIRT_DEFAULT_CONFIG = {
     .enable_proc_hiding       = true,
     .enable_fake_content      = true,
     .enable_timing_jitter     = false,
-    .enable_thread_sync       = true,
+    .enable_thread_sync       = false,
     .enable_kernel_compat     = true,
     .enable_self_diagnostics  = true,
     .enable_event_ring        = true,
@@ -2169,8 +2169,13 @@ int virt_seccomp_compile_and_install(VIRT_Config *cfg,
                                      int profile_count);
 int virt_seccomp_create_decoy_files(void);
 bool virt_decoy_file_create(const char *path, const char *const *lines);
+int virt_decoy_load_from_file(const char *filepath, char *out_buf, size_t buf_size);
+int virt_decoy_init(VIRT_Config *cfg);
+int virt_decoy_fd_open(const char *path);
+void virt_decoy_fd_preopen_all(void);
 extern const char *VIRT_DECOY_MAPS_PATH;
 extern const char *VIRT_DECOY_STATUS_PATH;
+extern const char *VIRT_DECOY_MOUNTINFO_PATH;
 extern const char *VIRT_DECOY_CMDLINE_PATH;
 extern const char *VIRT_DECOY_ENVIRON_PATH;
 extern const char *VIRT_DECOY_UPTIME_PATH;

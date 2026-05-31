@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "virtualizer.h"
 
-extern int virt_decoy_load_from_file(const char *filepath, char *out_buf, size_t buf_size);
-extern int virt_decoy_init(VIRT_Config *cfg);
-
 static int g_current_filter_fd = -1;
 
 typedef struct {
@@ -149,6 +146,71 @@ static uint64_t g_latency_histogram[VIRT_LATENCY_BUCKETS] = {0};
 static int g_handler_timerfd = -1;
 static int g_inotify_fd = -1;
 static int g_signalfd = -1;
+static sigset_t g_signalfd_old_mask;
+
+#define VIRT_DECOY_FD_CACHE_SIZE 32
+static int g_decoy_fds[VIRT_DECOY_FD_CACHE_SIZE];
+static const char *g_decoy_paths[VIRT_DECOY_FD_CACHE_SIZE];
+static int g_decoy_fd_count = 0;
+
+int virt_decoy_fd_open(const char *path) {
+    if (!path) return -1;
+    for (int i = 0; i < g_decoy_fd_count; i++) {
+        if (g_decoy_paths[i] && strcmp(g_decoy_paths[i], path) == 0) {
+            int new_fd = fcntl(g_decoy_fds[i], F_DUPFD_CLOEXEC, 0);
+            if (new_fd >= 0) return new_fd;
+        }
+    }
+    if (g_decoy_fd_count < VIRT_DECOY_FD_CACHE_SIZE) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return -1;
+        g_decoy_fds[g_decoy_fd_count] = fd;
+        g_decoy_paths[g_decoy_fd_count] = path;
+        g_decoy_fd_count++;
+        int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (new_fd < 0) { close(fd); g_decoy_fd_count--; return -1; }
+        return new_fd;
+    }
+    return open(path, O_RDONLY | O_CLOEXEC);
+}
+
+void virt_decoy_fd_preopen_all(void) {
+    const char *paths[] = {
+        VIRT_DECOY_MAPS_PATH,
+        VIRT_DECOY_STATUS_PATH,
+        VIRT_DECOY_MOUNTINFO_PATH,
+        VIRT_DECOY_CMDLINE_PATH,
+        VIRT_DECOY_ENVIRON_PATH,
+        VIRT_DECOY_UPTIME_PATH,
+        VIRT_DECOY_STAT_PATH,
+        VIRT_DECOY_SELINUX_PATH,
+        VIRT_DECOY_VERSION_PATH,
+        VIRT_DECOY_BOOTID_PATH,
+        VIRT_DECOY_HOSTNAME_PATH,
+        VIRT_DECOY_OSRELEASE_PATH,
+        VIRT_DECOY_OSTYPE_PATH,
+        VIRT_DECOY_CPUINFO_PATH,
+        VIRT_DECOY_FAKE_EXE_PATH,
+        VIRT_DECOY_IO_PATH,
+        VIRT_DECOY_OOM_PATH,
+        VIRT_DECOY_OOM_SCORE_PATH,
+        VIRT_DECOY_OOM_SCORE_ADJ_PATH,
+        VIRT_DECOY_WCHAN_PATH,
+        VIRT_DECOY_STACK_PATH,
+        VIRT_DECOY_SYSCALL_PATH,
+        VIRT_DECOY_PERSONALITY_PATH,
+        VIRT_DECOY_COREDUMP_FILTER_PATH,
+        VIRT_DECOY_TIMERS_PATH,
+        VIRT_DECOY_LOGINUID_PATH,
+        VIRT_DECOY_SESSIONID_PATH,
+        VIRT_DECOY_COMM_PATH,
+        NULL,
+    };
+    for (int i = 0; paths[i]; i++) {
+        virt_decoy_fd_open(paths[i]);
+    }
+    VIRT_LOGI("Decoy fd cache: %d files pre-opened", g_decoy_fd_count);
+}
 
 static int virt_create_handler_timer(void) {
     int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
@@ -157,20 +219,28 @@ static int virt_create_handler_timer(void) {
         .it_interval = { .tv_sec = 5, .tv_nsec = 0 },
         .it_value = { .tv_sec = 5, .tv_nsec = 0 },
     };
-    timerfd_settime(fd, 0, &ts, NULL);
+    if (timerfd_settime(fd, 0, &ts, NULL) < 0) {
+        VIRT_LOGW("timerfd_settime failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
 static int virt_setup_inotify(void) {
     int fd = inotify_init1(IN_NONBLOCK);
     if (fd < 0) return -1;
-    inotify_add_watch(fd, "/data/local/tmp/virtualizer/config.txt", IN_CLOSE_WRITE);
-    inotify_add_watch(fd, "/data/local/tmp/virtualizer/rules.json", IN_CLOSE_WRITE);
+    if (inotify_add_watch(fd, "/data/local/tmp/virtualizer/config.txt", IN_CLOSE_WRITE) < 0) {
+        VIRT_LOGW("inotify: cannot watch config.txt: %s", strerror(errno));
+    }
+    if (inotify_add_watch(fd, "/data/local/tmp/virtualizer/rules.json", IN_CLOSE_WRITE) < 0) {
+        VIRT_LOGW("inotify: cannot watch rules.json: %s", strerror(errno));
+    }
     return fd;
 }
 
 static int virt_setup_signalfd(void) {
-    sigset_t mask;
+    sigset_t mask, old_mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGINT);
@@ -178,8 +248,18 @@ static int virt_setup_signalfd(void) {
     sigaddset(&mask, SIGUSR1);
     sigaddset(&mask, SIGUSR2);
     sigaddset(&mask, SIGPIPE);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
-    return signalfd(-1, &mask, SFD_NONBLOCK);
+    if (sigprocmask(SIG_BLOCK, &mask, &old_mask) < 0) {
+        VIRT_LOGW("sigprocmask block failed: %s", strerror(errno));
+        return -1;
+    }
+    int fd = signalfd(-1, &mask, SFD_NONBLOCK);
+    if (fd < 0) {
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        VIRT_LOGW("signalfd creation failed: %s", strerror(errno));
+        return -1;
+    }
+    g_signalfd_old_mask = old_mask;
+    return fd;
 }
 
 const char *VIRT_DECOY_MAPS_PATH = "/data/local/tmp/clean_maps";
@@ -368,7 +448,7 @@ bool virt_decoy_file_create(const char *path, const char *const *lines) {
 
 static int virt_seccomp_try_addfd(int notify_fd, const struct seccomp_notif *req,
                                    const char *redirect_path) {
-    int local_fd = open(redirect_path, O_RDONLY | O_CLOEXEC);
+    int local_fd = virt_decoy_fd_open(redirect_path);
     if (local_fd < 0) return -errno;
     struct seccomp_notif_addfd addfd;
     memset(&addfd, 0, sizeof(addfd));
@@ -1283,12 +1363,12 @@ long virt_seccomp_execute_syscall(struct seccomp_notif *req) {
         case __NR_mprotect:
             return virt_seccomp_execute_mprotect(a0, a1, a2);
         case __NR_ptrace:
-            return 0;
+            return -EPERM;
         case __NR_uname:
             return virt_seccomp_execute_uname(a0, pid);
         case __NR_unlinkat:
         case __NR_renameat2:
-            return 0;
+            return -ENOENT;
         default:
             __sync_fetch_and_add(&g_seccomp_engine_errors, 1);
             return -ENOSYS;
@@ -1392,9 +1472,14 @@ int virt_seccomp_handler_loop(void *arg) {
         free(stats);
         free(proc_hider);
         close(notify_fd);
+        g_virt_notify_fd = -1;
         if (g_handler_timerfd >= 0) { close(g_handler_timerfd); g_handler_timerfd = -1; }
         if (g_inotify_fd >= 0) { close(g_inotify_fd); g_inotify_fd = -1; }
-        if (g_signalfd >= 0) { close(g_signalfd); g_signalfd = -1; }
+        if (g_signalfd >= 0) {
+            close(g_signalfd);
+            g_signalfd = -1;
+            sigprocmask(SIG_SETMASK, &g_signalfd_old_mask, NULL);
+        }
         return VIRT_ERR_NOMEM;
     }
     assert(cache != NULL);
@@ -1408,15 +1493,20 @@ int virt_seccomp_handler_loop(void *arg) {
     memset(&jitter, 0, sizeof(jitter));
 
     VIRT_Config decoy_cfg = VIRT_DEFAULT_CONFIG;
-    if (virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &decoy_cfg) == VIRT_OK) {
-        VIRT_LOGI("Handler: config loaded from %s", VIRT_DEFAULT_CONFIG.config_path);
-        int val_errors = virt_config_validate(&decoy_cfg);
-        if (val_errors > 0) {
-            VIRT_LOGW("Handler: config had %d validation warnings/errors", val_errors);
+    if (!g_seccomp_engine_has_tsync) {
+        if (virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &decoy_cfg) == VIRT_OK) {
+            VIRT_LOGI("Handler: config loaded from %s", VIRT_DEFAULT_CONFIG.config_path);
+            int val_errors = virt_config_validate(&decoy_cfg);
+            if (val_errors > 0) {
+                VIRT_LOGW("Handler: config had %d validation warnings/errors", val_errors);
+            }
         }
+        decoy_cfg.enable_file_decoy = true;
+        virt_decoy_init(&decoy_cfg);
+    } else {
+        VIRT_LOGI("Handler: TSYNC active, skipping config/decoy load "
+                  "(must be pre-loaded before seccomp install)");
     }
-    decoy_cfg.enable_file_decoy = true;
-    virt_decoy_init(&decoy_cfg);
 
     stats->last_reset_tp = virt_gettime_ns();
     health.handler_state = VIRT_HANDLER_RUNNING;
@@ -2356,7 +2446,9 @@ int virt_seccomp_handler_loop(void *arg) {
                 VIRT_LOGI("Periodic stats:\n%s\n%s%s", stats_buf, hist_buf,
                           pressure > 0 ? " [MEM PRESSURE]" : "");
             }
-            virt_detection_score_log();
+            if (!g_seccomp_engine_has_tsync) {
+                virt_detection_score_log();
+            }
         }
 
         if (health.processed_events % 1000 == 0) {
@@ -2375,9 +2467,14 @@ int virt_seccomp_handler_loop(void *arg) {
     if (notify_fd >= 0) {
         close(notify_fd);
     }
+    g_virt_notify_fd = -1;
     if (g_handler_timerfd >= 0) { close(g_handler_timerfd); g_handler_timerfd = -1; }
     if (g_inotify_fd >= 0) { close(g_inotify_fd); g_inotify_fd = -1; }
-    if (g_signalfd >= 0) { close(g_signalfd); g_signalfd = -1; }
+    if (g_signalfd >= 0) {
+        close(g_signalfd);
+        g_signalfd = -1;
+        sigprocmask(SIG_SETMASK, &g_signalfd_old_mask, NULL);
+    }
 
     double avg_lat = g_seccomp_engine_total_latency_ns /
                      (double)VIRT_MAX(health.processed_events, 1ULL);

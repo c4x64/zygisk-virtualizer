@@ -289,9 +289,17 @@ install_seccomp:
         VIRT_ZYGISK_LOGI("onLoad: name=%s uid=%u", proc_name, uid);
         g_virt_app_count++;
 
-        /* Create decoy files BEFORE seccomp install — the handler thread
-         * inherits the filter and would deadlock trying to create them. */
+        /* Create decoy files and load pre-seccomp resources BEFORE seccomp
+         * install — the handler thread inherits the filter if TSYNC is
+         * active and would deadlock trying to access file paths. */
         virt_seccomp_create_decoy_files();
+        virt_decoy_fd_preopen_all();
+        {
+            VIRT_Config pre_cfg = VIRT_DEFAULT_CONFIG;
+            virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &pre_cfg);
+            pre_cfg.enable_file_decoy = true;
+            virt_decoy_init(&pre_cfg);
+        }
 
         VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
         virt_config_auto_tune(&cfg);
@@ -380,6 +388,13 @@ install_seccomp:
 
         virt_code_register_self();
         virt_seccomp_create_decoy_files();
+        virt_decoy_fd_preopen_all();
+        {
+            VIRT_Config pre_cfg = VIRT_DEFAULT_CONFIG;
+            virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &pre_cfg);
+            pre_cfg.enable_file_decoy = true;
+            virt_decoy_init(&pre_cfg);
+        }
 
         int fd = virt_seccomp_install_static_default(&cfg);
         if (fd < 0) { g_virt_fail_count++; return; }

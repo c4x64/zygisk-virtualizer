@@ -1306,8 +1306,8 @@ int virt_anti_tamper_detect_ptrace(void) {
 #ifndef PTRACE_TRACEME
     return virt_anti_tamper_detect_debugger();
 #else
-    int ret = ptrace(PTRACE_TRACEME, 0, 0, 0);
-    if (ret == 0) { ptrace(PTRACE_DETACH, 0, 0, 0); return 0; }
+    int ret = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+    if (ret == 0) { ptrace(PTRACE_DETACH, 0, NULL, NULL); return 0; }
     return (errno == EPERM) ? 1 : 0;
 #endif
 }
@@ -2363,7 +2363,8 @@ void virt_anti_tamper_check_self(void) {
         g_anti_tamper_state.tamper_detected = true;
         g_anti_tamper_state.tamper_type = VIRT_TAMPER_TRACING;
         g_anti_tamper_state.last_tamper_time = time(NULL);
-        g_anti_tamper_state.tamper_count++;
+        if (g_anti_tamper_state.tamper_count < UINT32_MAX)
+            g_anti_tamper_state.tamper_count++;
         return;
     }
 
@@ -2373,7 +2374,8 @@ void virt_anti_tamper_check_self(void) {
         g_anti_tamper_state.tamper_detected = true;
         g_anti_tamper_state.tamper_type = VIRT_TAMPER_SECCOMP;
         g_anti_tamper_state.last_tamper_time = time(NULL);
-        g_anti_tamper_state.tamper_count++;
+        if (g_anti_tamper_state.tamper_count < UINT32_MAX)
+            g_anti_tamper_state.tamper_count++;
     }
 
     struct pollfd pfd = { .fd = g_virt_notify_fd, .events = POLLIN };
@@ -2382,7 +2384,8 @@ void virt_anti_tamper_check_self(void) {
         g_anti_tamper_state.tamper_detected = true;
         g_anti_tamper_state.tamper_type = VIRT_TAMPER_NOTIFY_FD;
         g_anti_tamper_state.last_tamper_time = time(NULL);
-        g_anti_tamper_state.tamper_count++;
+        if (g_anti_tamper_state.tamper_count < UINT32_MAX)
+            g_anti_tamper_state.tamper_count++;
     }
 }
 
@@ -2560,7 +2563,8 @@ int virt_anti_tamper_loop(void *arg) {
         }
 
         if (sh > 0) {
-            g_anti_tamper_state.tamper_count++;
+            if (g_anti_tamper_state.tamper_count < UINT32_MAX)
+                g_anti_tamper_state.tamper_count++;
             VIRT_LOGW("Shell access detected via anti-tamper scan");
         }
 
