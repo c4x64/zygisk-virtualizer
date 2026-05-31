@@ -196,6 +196,7 @@ const char *VIRT_DECOY_HOSTNAME_PATH = "/data/local/tmp/clean_hostname";
 const char *VIRT_DECOY_OSRELEASE_PATH = "/data/local/tmp/clean_osrelease";
 const char *VIRT_DECOY_OSTYPE_PATH = "/data/local/tmp/clean_ostype";
 const char *VIRT_DECOY_CPUINFO_PATH = "/data/local/tmp/clean_cpuinfo";
+const char *VIRT_DECOY_FAKE_EXE_PATH = "/data/local/tmp/virtualizer/fake_exe";
 
 static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
     "1 0 0:0 / / rw,relatime shared:1 - rootfs rootfs rw",
@@ -307,6 +308,11 @@ static const char *VIRT_FAKE_CPUINFO_CONTENT[] = {
     "CPU revision\t: 14",
     "",
     "Hardware\t: Qualcomm Technologies, Inc SM8550",
+    NULL,
+};
+
+static const char *VIRT_FAKE_EXE_CONTENT[] = {
+    "/system/bin/app_process64",
     NULL,
 };
 
@@ -784,6 +790,22 @@ int virt_seccomp_create_decoy_files(void) {
         VIRT_LOGD("Decoy cpuinfo created at %s", VIRT_DECOY_CPUINFO_PATH);
         ok++;
     }
+    /* Fake /proc/modules — empty, no kernel modules loaded */
+    static const char *VIRT_FAKE_MODULES_CONTENT[] = {"", NULL};
+    if (virt_decoy_file_create("/data/local/tmp/virtualizer/fake_modules", VIRT_FAKE_MODULES_CONTENT)) {
+        VIRT_LOGD("Fake modules created at /data/local/tmp/virtualizer/fake_modules");
+        ok++;
+    }
+    /* Fake /proc/kallsyms — empty, kptr_restrict=2 hides all symbols */
+    static const char *VIRT_FAKE_KALLSYMS_CONTENT[] = {"", NULL};
+    if (virt_decoy_file_create("/data/local/tmp/virtualizer/fake_kallsyms", VIRT_FAKE_KALLSYMS_CONTENT)) {
+        VIRT_LOGD("Fake kallsyms created at /data/local/tmp/virtualizer/fake_kallsyms");
+        ok++;
+    }
+    if (virt_decoy_file_create(VIRT_DECOY_FAKE_EXE_PATH, VIRT_FAKE_EXE_CONTENT)) {
+        VIRT_LOGD("Decoy fake_exe created at %s", VIRT_DECOY_FAKE_EXE_PATH);
+        ok++;
+    }
     return ok;
 }
 
@@ -1112,6 +1134,8 @@ long virt_seccomp_execute_syscall(struct seccomp_notif *req) {
             return virt_seccomp_execute_mmap(a0, a1, a2, a3, a4, a5);
         case __NR_mprotect:
             return virt_seccomp_execute_mprotect(a0, a1, a2);
+        case __NR_ptrace:
+            return 0;
         case __NR_uname:
             return virt_seccomp_execute_uname(a0, pid);
         case __NR_unlinkat:
@@ -1166,6 +1190,7 @@ int virt_seccomp_handler_loop(void *arg) {
     g_handler_timerfd = virt_create_handler_timer();
     g_inotify_fd = virt_setup_inotify();
     g_signalfd = virt_setup_signalfd();
+    g_virt_notify_fd = notify_fd;
     if (g_handler_timerfd >= 0)
         VIRT_LOGD("Handler timer created (fd=%d)", g_handler_timerfd);
     if (g_inotify_fd >= 0)
@@ -1881,9 +1906,50 @@ int virt_seccomp_handler_loop(void *arg) {
             }
         }
 
+        /* --- /proc/self/exe fstatat64 Passthrough ---
+         * fstatat64 on /proc/self/exe would match the blocked patterns list
+         * and return -ENOENT, which is suspicious. Pass through instead. */
+        if (!should_redirect && path_readable && path_len > 0 &&
+            req.data.nr == __NR_newfstatat &&
+            strstr(path_buf, "/exe") && strstr(path_buf, "/proc/")) {
+            resolved = true;
+            action = VIRT_ACTION_ALLOW;
+            VIRT_LOGD("[fstatat64] PASSTHROUGH /proc/self/exe -> %s", path_buf);
+        }
+
+        /* --- ptrace Interception ---
+         * Anti-cheat engines use ptrace() to attach to processes.
+         * Block ptrace ATTACH/DETACH on our process, allow TRACEME. */
+        if (req.data.nr == __NR_ptrace) {
+            long request = (long)req.data.args[0];
+            pid_t target_pid = (pid_t)req.data.args[1];
+            if (request == PTRACE_TRACEME) {
+                resp.error = 0;
+                resp.val = 0;
+                resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                VIRT_LOGD("[ptrace] PTRACE_TRACEME allowed");
+            } else if (target_pid == 0 || target_pid == getpid()) {
+                resp.error = -EPERM;
+                resp.val = 0;
+                resp.flags = 0;
+                VIRT_LOGD("[ptrace] %s(%d) BLOCKED (target=self)",
+                    request == PTRACE_ATTACH ? "PTRACE_ATTACH" :
+                    request == PTRACE_DETACH ? "PTRACE_DETACH" : "ptrace",
+                    target_pid);
+            } else {
+                resp.error = 0;
+                resp.val = 0;
+                resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                VIRT_LOGD("[ptrace] ptrace(%ld, %d) allowed (target not self)",
+                    request, target_pid);
+            }
+            /* resp is set; send_direct will send it below */
+        }
+
         if (!should_redirect) {
             bool send_direct = (req.data.nr == __NR_prctl) ||
-                               (req.data.nr == __NR_uname);
+                               (req.data.nr == __NR_uname) ||
+                               (req.data.nr == __NR_ptrace);
             if (req.data.nr == __NR_mprotect) {
                 const ShadowLibraryMirror *sm = virt_get_shadow_mirror();
                 if (sm && sm->initialized &&
@@ -2049,6 +2115,7 @@ int virt_seccomp_handler_loop(void *arg) {
                 VIRT_LOGI("Periodic stats:\n%s\n%s%s", stats_buf, hist_buf,
                           pressure > 0 ? " [MEM PRESSURE]" : "");
             }
+            virt_detection_score_log();
         }
 
         if (health.processed_events % 1000 == 0) {

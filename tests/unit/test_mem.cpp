@@ -28,7 +28,6 @@ static void test_alloc_free_balance() {
 }
 
 static void test_peak_tracking() {
-    size_t prev_peak = virt_mem_get_peak();
     size_t before = virt_mem_get_usage();
     virt_mem_track_alloc(5000);
     size_t peak1 = virt_mem_get_peak();

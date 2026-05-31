@@ -342,9 +342,40 @@ install_seccomp:
 
         VIRT_ZYGISK_LOGI("preAppSpecialize: name=%s uid=%u", proc_name, uid);
 
+        /* Apply package-specific profile if one exists */
+        VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
+        VIRT_PackageProfile *profile = virt_config_find_package_profile(&cfg, proc_name);
+        if (profile) {
+            VIRT_ZYGISK_LOGI("Applying profile for %s (flags=0x%04x)",
+                             proc_name, profile->profile_flags);
+            if (profile->profile_flags & VIRT_PROFILE_STRICT) {
+                cfg.filter_mode = VIRT_FILTER_MODE_BPF_DYNAMIC;
+            }
+            if (profile->profile_flags & VIRT_PROFILE_AGGRESSIVE) {
+                cfg.filter_mode = VIRT_FILTER_MODE_BPF_DYNAMIC;
+                cfg.enable_anti_tamper = true;
+                cfg.enable_self_diagnostics = true;
+            }
+            if (profile->profile_flags & VIRT_PROFILE_STEALTH) {
+                cfg.enable_timing_jitter = true;
+                cfg.enable_proc_hiding = true;
+            }
+            if (profile->profile_flags & VIRT_PROFILE_LEGACY) {
+                cfg.enable_kernel_compat = true;
+                cfg.enable_thread_sync = false;
+            }
+            if (profile->profile_flags & VIRT_PROFILE_GAME) {
+                cfg.cache_size = VIRT_MAX_CACHED_PATHS;
+            }
+            if (profile->profile_flags & VIRT_PROFILE_ANTI_CHEAT) {
+                cfg.enable_anti_tamper = true;
+                cfg.enable_self_diagnostics = true;
+                cfg.enable_latency_tracking = true;
+            }
+        }
+
         virt_seccomp_create_decoy_files();
 
-        VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
         int fd = virt_seccomp_install_static_default(&cfg);
         if (fd < 0) { g_virt_fail_count++; return; }
 

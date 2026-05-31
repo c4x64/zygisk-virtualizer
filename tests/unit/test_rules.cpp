@@ -251,6 +251,10 @@ static void test_load_defaults() {
         failures++;
     } else {
         printf("PASS: rules load defaults (%u rules)\n", g_rule_count);
+        if (g_rule_count != 179) {
+            printf("FAIL: expected 179 default rules, got %u\n", g_rule_count);
+            failures++;
+        }
     }
 }
 

@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
@@ -73,6 +74,7 @@
 #include <algorithm>
 #include <sys/un.h>
 #include <sys/utsname.h>
+#include <sys/ptrace.h>
 
 #define VIRT_LOG_TAG "Virtualizer"
 
@@ -283,6 +285,33 @@
 
 #ifndef __NR_uname
 #define __NR_uname 160
+#endif
+
+#ifndef __NR_ptrace
+#if defined(__aarch64__)
+#define __NR_ptrace 117
+#elif defined(__arm__)
+#define __NR_ptrace 26
+#endif
+#endif
+
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+#ifndef PTRACE_ATTACH
+#define PTRACE_ATTACH 16
+#endif
+#ifndef PTRACE_DETACH
+#define PTRACE_DETACH 17
+#endif
+
+/* fstatat64 is __NR_newfstatat on ARM64, but some code references it by name */
+#ifndef __NR_fstatat64
+#if defined(__aarch64__)
+#define __NR_fstatat64 __NR_newfstatat
+#elif defined(__arm__)
+#define __NR_fstatat64 327
+#endif
 #endif
 
 #ifndef __NR_process_vm_readv
@@ -692,6 +721,7 @@ enum VIRT_SYSCALL_NR : int {
     VIRT_NR_ioctl           = 29,
     VIRT_NR_prctl           = 167,
     VIRT_NR_uname           = 160,
+    VIRT_NR_ptrace          = 117,
     VIRT_NR_clone3          = 435,
     VIRT_NR_exit_group      = 94,
     VIRT_NR_clone           = 220,
@@ -903,6 +933,18 @@ typedef struct VIRT_Rule {
     bool     is_system;
 } VIRT_Rule;
 
+#define VIRT_PROFILE_STRICT         0x0001
+#define VIRT_PROFILE_AGGRESSIVE     0x0002
+#define VIRT_PROFILE_STEALTH        0x0004
+#define VIRT_PROFILE_LEGACY         0x0008
+#define VIRT_PROFILE_GAME           0x0010
+#define VIRT_PROFILE_ANTI_CHEAT     0x0020
+
+typedef struct {
+    char package_name[64];
+    uint32_t profile_flags;
+} VIRT_PackageProfile;
+
 typedef struct VIRT_Config {
     char config_path[VIRT_PATH_BUF_SIZE];
     char rules_path[VIRT_PATH_BUF_SIZE];
@@ -945,6 +987,8 @@ typedef struct VIRT_Config {
     uint32_t reconnect_delay_ms;
     uint32_t max_consecutive_errors;
     uint32_t max_event_ring_entries;
+    VIRT_PackageProfile package_profiles[16];
+    int package_profile_count;
 } VIRT_Config;
 
 typedef struct VIRT_CacheEntry {
@@ -1053,6 +1097,17 @@ typedef struct VIRT_ThreadMonitor {
     uint64_t  blocked_count;
 } VIRT_ThreadMonitor;
 
+typedef enum {
+    VIRT_TAMPER_NONE = 0,
+    VIRT_TAMPER_TRACING,
+    VIRT_TAMPER_SECCOMP,
+    VIRT_TAMPER_NOTIFY_FD,
+    VIRT_TAMPER_CODE_MODIFIED,
+    VIRT_TAMPER_ENVIRONMENT,
+    VIRT_TAMPER_SIGNAL,
+    VIRT_TAMPER_MEMORY,
+} VIRT_TamperType;
+
 typedef struct VIRT_AntiTamperState {
     bool initialized;
     bool integrity_ok;
@@ -1061,6 +1116,11 @@ typedef struct VIRT_AntiTamperState {
     bool ptrace_detected;
     bool memory_modified;
     bool code_page_writable;
+    bool tamper_detected;
+    VIRT_TamperType tamper_type;
+    time_t last_tamper_time;
+    uint32_t tamper_count;
+    char tamper_detail[128];
     uint64_t last_check_ns;
     uint64_t check_interval_ns;
     uint32_t integrity_failures;
@@ -1080,6 +1140,9 @@ typedef struct VIRT_AntiTamperState {
     uint32_t detected_ptrace;
     int      last_check_result;
 } VIRT_AntiTamperState;
+
+extern VIRT_AntiTamperState g_anti_tamper_state;
+extern int g_virt_notify_fd;
 
 typedef struct VIRT_ProcHiderState {
     bool initialized;
@@ -1285,6 +1348,7 @@ static const VIRT_SeccompFilterProfile DEFAULT_FILTER_PROFILES[] = {
     { __NR_ioctl,         VIRT_CAT_DEBUG,      false, "ioctl"         },
     { __NR_prctl,         VIRT_CAT_DEBUG,      true,  "prctl"         },
     { __NR_uname,         VIRT_CAT_OTHER,      true,  "uname"         },
+    { __NR_ptrace,        VIRT_CAT_DEBUG,      true,  "ptrace"        },
     { __NR_unlinkat,      VIRT_CAT_FILE_WRITE, true,  "unlinkat"      },
     { __NR_renameat2,     VIRT_CAT_FILE_WRITE, true,  "renameat2"     },
     { -1,                 VIRT_CAT_OTHER,      false, "terminator"    },
@@ -1376,6 +1440,7 @@ static const VIRT_Config VIRT_DEFAULT_CONFIG = {
     .reconnect_delay_ms       = 1000,
     .max_consecutive_errors   = 10,
     .max_event_ring_entries   = VIRT_EVENT_RING_SIZE,
+    .package_profile_count    = 0,
 };
 
 static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
@@ -1527,6 +1592,42 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "/proc/net/udp",
     "/proc/net/unix",
     "/proc/net/route",
+
+    /* +33 patterns: detection framework paths */
+    "/data/local/tmp/chelper",
+    "/data/local/tmp/cexo",
+    "/data/local/tmp/drkg",
+    "/data/local/tmp/ez4u",
+    "/data/local/tmp/gfree",
+    "/data/local/tmp/gkworld",
+    "/data/local/tmp/hluda",
+    "/data/local/tmp/kysdk",
+    "/data/local/tmp/lansp",
+    "/data/local/tmp/mfpub",
+    "/data/local/tmp/niwot",
+    "/data/local/tmp/reflutter",
+    "/data/local/tmp/sgiwp",
+    "/data/local/tmp/taoyy",
+    "/data/local/tmp/utroot",
+    "/data/local/tmp/vproxy",
+    "/data/local/tmp/wsroot",
+    "/data/local/tmp/run.sh",
+    "/data/local/tmp/shizuku",
+    "/data/local/tmp/KingUser",
+    "/data/local/tmp/kinguser",
+    "/data/local/tmp/rootbeer",
+    "/data/local/tmp/binaryeye",
+    "/proc/modules",
+    "/proc/kallsyms",
+    "/system/default.prop",
+    "/data/adb/service.d",
+    "/data/adb/post-fs-data.d",
+    "/system/xbin/su",
+    "/system/sd/xbin/su",
+    "/data/data/eu.chainfire.supersu",
+    "/system/xbin/busybox",
+    "/system/bin/busybox",
+    "/data/data/burrows.apps.busybox",
     NULL,
 };
 
@@ -1719,6 +1820,7 @@ static inline bool virt_is_syscall_intercepted(int nr) {
         case __NR_mprotect:
         case __NR_connect:
         case __NR_uname:
+        case __NR_ptrace:
         case __NR_unlinkat:
         case __NR_renameat2:
             return true;
@@ -1765,6 +1867,7 @@ static inline const char *virt_syscall_name(int nr) {
         case __NR_fcntl:      return "fcntl";
         case __NR_dup3:       return "dup3";
         case __NR_uname:      return "uname";
+        case __NR_ptrace:     return "ptrace";
         case __NR_unlinkat:   return "unlinkat";
         case __NR_renameat2:  return "renameat2";
         default:              return "unknown";
@@ -1852,6 +1955,8 @@ bool virt_path_match(const char *path, size_t path_len,
                      const char *pattern, int match_type);
 int virt_config_load(const char *path, VIRT_Config *cfg);
 int virt_config_validate(VIRT_Config *cfg);
+int virt_config_add_package_profile(VIRT_Config *cfg, const char *package, uint32_t flags);
+VIRT_PackageProfile *virt_config_find_package_profile(VIRT_Config *cfg, const char *package);
 int virt_run_self_test(void);
 int virt_config_generate_default(const char *path);
 int virt_stats_init(VIRT_SyscallStats *stats);
@@ -1928,6 +2033,7 @@ extern const char *VIRT_DECOY_HOSTNAME_PATH;
 extern const char *VIRT_DECOY_OSRELEASE_PATH;
 extern const char *VIRT_DECOY_OSTYPE_PATH;
 extern const char *VIRT_DECOY_CPUINFO_PATH;
+extern const char *VIRT_DECOY_FAKE_EXE_PATH;
 int virt_seccomp_read_path(struct seccomp_notif *req,
                              char *buf, size_t buf_size,
                              uint64_t path_addr);
@@ -1985,7 +2091,20 @@ typedef struct {
     char name[64];
 } VIRT_SocketInfo;
 
+typedef struct {
+    float root_score;
+    float frida_score;
+    float xposed_score;
+    float emulator_score;
+    float debugger_score;
+    float overall_score;
+    char recommendations[512];
+} VIRT_DetectionScore;
+
 int virt_scan_sockets(VIRT_SocketInfo *sockets, int max_sockets);
+int virt_compute_detection_score(VIRT_DetectionScore *score);
+void virt_detection_score_log(void);
+void virt_anti_tamper_check_self(void);
 int virt_anti_tamper_loop(void *arg);
 int virt_spoof_uname(struct utsname *uts);
 void virt_set_uptime_base(uint64_t seconds);

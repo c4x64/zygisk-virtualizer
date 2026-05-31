@@ -24,6 +24,9 @@ typedef struct {
 
 static VIRT_MemoryStats g_mem_stats;
 
+int g_virt_notify_fd = -1;
+VIRT_AntiTamperState g_anti_tamper_state;
+
 void virt_mem_track_alloc(size_t size) {
     g_mem_stats.total_allocated += size;
     if (g_mem_stats.total_allocated > g_mem_stats.peak_allocated) {
@@ -525,7 +528,7 @@ int virt_process_profile_detect(VIRT_ProcessProfileInfo *info) {
 }
 
 int virt_cache_flush(VIRT_CacheEntry *cache, uint32_t *cache_count) {
-    if (!cache || !cache_count) return VIRT_OK;
+    if (!cache || !cache_count) return VIRT_ERR_INVAL;
     memset(cache, 0, sizeof(VIRT_CacheEntry) * (*cache_count));
     *cache_count = 0;
     return VIRT_OK;
@@ -914,11 +917,6 @@ int virt_stats_snapshot(const VIRT_SyscallStats *stats, char *buf, size_t buf_si
 }
 
 // Look up a path in the cache.
-// @param cache - cache array (non-null)
-// @param cache_count - number of valid entries
-// @param path - path to look up
-// @param path_len - length of path
-// @return cached action on hit, VIRT_ERR_NOENT on miss, VIRT_ERR_INVAL on bad args
 int virt_cache_lookup(VIRT_CacheEntry *cache, uint32_t cache_count, const char *path, uint32_t path_len) {
     if (!cache || !path || !path_len) return VIRT_ERR_INVAL;
     if (path_len > VIRT_PATH_BUF_SIZE) return VIRT_ERR_INVAL;
@@ -1248,8 +1246,8 @@ int virt_anti_tamper_detect_ptrace(void) {
 #ifndef PTRACE_TRACEME
     return virt_anti_tamper_detect_debugger();
 #else
-    int ret = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-    if (ret == 0) { ptrace(PTRACE_DETACH, 0, NULL, NULL); return 0; }
+    int ret = ptrace(PTRACE_TRACEME, 0, 0, 0);
+    if (ret == 0) { ptrace(PTRACE_DETACH, 0, 0, 0); return 0; }
     return (errno == EPERM) ? 1 : 0;
 #endif
 }
@@ -1350,9 +1348,38 @@ int virt_config_load(const char *path, VIRT_Config *cfg) {
         else if (!strcmp(key, "config_path")) virt_safe_strncpy(cfg->config_path, val, sizeof(cfg->config_path));
         else if (!strcmp(key, "rules_path")) virt_safe_strncpy(cfg->rules_path, val, sizeof(cfg->rules_path));
         else if (!strcmp(key, "log_tag")) virt_safe_strncpy(cfg->log_tag, val, sizeof(cfg->log_tag));
+        else if (!strcmp(key, "package_profile")) {
+            char pkg[64];
+            uint32_t flags = 0;
+            if (sscanf(val, "%63s %x", pkg, &flags) >= 2) {
+                virt_config_add_package_profile(cfg, pkg, flags);
+            }
+        }
     }
     fclose(f);
     return VIRT_OK;
+}
+
+int virt_config_add_package_profile(VIRT_Config *cfg, const char *package, uint32_t flags) {
+    if (!cfg || !package) return VIRT_ERR_INVAL;
+    if (cfg->package_profile_count >= 16) return VIRT_ERR_BUSY;
+    int idx = cfg->package_profile_count;
+    virt_safe_strncpy(cfg->package_profiles[idx].package_name, package,
+                      sizeof(cfg->package_profiles[idx].package_name));
+    cfg->package_profiles[idx].profile_flags = flags;
+    cfg->package_profile_count++;
+    VIRT_LOGI("Package profile added: %s (flags=0x%04x)", package, flags);
+    return VIRT_OK;
+}
+
+VIRT_PackageProfile *virt_config_find_package_profile(VIRT_Config *cfg, const char *package) {
+    if (!cfg || !package) return NULL;
+    for (int i = 0; i < cfg->package_profile_count; i++) {
+        if (strcmp(cfg->package_profiles[i].package_name, package) == 0) {
+            return &cfg->package_profiles[i];
+        }
+    }
+    return NULL;
 }
 
 int virt_config_validate(VIRT_Config *cfg) {
@@ -2218,11 +2245,161 @@ static int virt_check_suspicious_fds(void) {
     return suspicious;
 }
 
+void virt_anti_tamper_check_self(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    pid_t tracer_pid = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "TracerPid:\t%d", &tracer_pid) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+
+    if (tracer_pid > 0) {
+        VIRT_LOGW("Self-tamper detected: tracer pid=%d", tracer_pid);
+        g_anti_tamper_state.tamper_detected = true;
+        g_anti_tamper_state.tamper_type = VIRT_TAMPER_TRACING;
+        g_anti_tamper_state.last_tamper_time = time(NULL);
+        g_anti_tamper_state.tamper_count++;
+        return;
+    }
+
+    int ret = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    if (ret <= 0) {
+        VIRT_LOGW("Seccomp filter removed! ret=%d", ret);
+        g_anti_tamper_state.tamper_detected = true;
+        g_anti_tamper_state.tamper_type = VIRT_TAMPER_SECCOMP;
+        g_anti_tamper_state.last_tamper_time = time(NULL);
+        g_anti_tamper_state.tamper_count++;
+    }
+
+    struct pollfd pfd = { .fd = g_virt_notify_fd, .events = POLLIN };
+    if (g_virt_notify_fd >= 0 && poll(&pfd, 1, 0) < 0 && errno == EBADF) {
+        VIRT_LOGW("Notify fd invalidated!");
+        g_anti_tamper_state.tamper_detected = true;
+        g_anti_tamper_state.tamper_type = VIRT_TAMPER_NOTIFY_FD;
+        g_anti_tamper_state.last_tamper_time = time(NULL);
+        g_anti_tamper_state.tamper_count++;
+    }
+}
+
+int virt_compute_detection_score(VIRT_DetectionScore *score) {
+    if (!score) return VIRT_ERR_INVAL;
+    memset(score, 0, sizeof(*score));
+
+    if (access("/system/app/Superuser.apk", F_OK) == 0) score->root_score += 0.3f;
+    if (access("/data/data/com.topjohnwu.magisk", F_OK) == 0) score->root_score += 0.5f;
+    if (access("/data/adb/magisk", F_OK) == 0) score->root_score += 0.4f;
+    if (access("/sbin/su", F_OK) == 0) score->root_score += 0.3f;
+    if (access("/system/xbin/su", F_OK) == 0) score->root_score += 0.3f;
+
+    if (access("/data/local/tmp/frida-server", F_OK) == 0) score->frida_score += 0.5f;
+    if (access("/data/local/tmp/re.frida", F_OK) == 0) score->frida_score += 0.4f;
+    if (access("/data/local/tmp/.frida", F_OK) == 0) score->frida_score += 0.3f;
+    {
+        char maps_line[512];
+        FILE *mp = fopen("/proc/self/maps", "r");
+        if (mp) {
+            while (fgets(maps_line, sizeof(maps_line), mp)) {
+                if (strstr(maps_line, "frida") || strstr(maps_line, "gum-")) {
+                    score->frida_score += 0.4f;
+                    break;
+                }
+            }
+            fclose(mp);
+        }
+    }
+    score->frida_score = VIRT_MIN(score->frida_score, 1.0f);
+
+    if (access("/data/local/tmp/xposed", F_OK) == 0) score->xposed_score += 0.4f;
+    if (access("/data/local/tmp/lsposed", F_OK) == 0) score->xposed_score += 0.5f;
+    if (access("/data/local/tmp/edxposed", F_OK) == 0) score->xposed_score += 0.4f;
+    if (access("/data/local/tmp/riru", F_OK) == 0) score->xposed_score += 0.3f;
+    {
+        char maps_line[512];
+        FILE *mp = fopen("/proc/self/maps", "r");
+        if (mp) {
+            while (fgets(maps_line, sizeof(maps_line), mp)) {
+                if (strstr(maps_line, "xposed") || strstr(maps_line, "lsposed") ||
+                    strstr(maps_line, "edxp") || strstr(maps_line, "riru") ||
+                    strstr(maps_line, "substrate")) {
+                    score->xposed_score += 0.4f;
+                    break;
+                }
+            }
+            fclose(mp);
+        }
+    }
+    score->xposed_score = VIRT_MIN(score->xposed_score, 1.0f);
+
+    {
+        char pname[256] = {};
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, pname, sizeof(pname) - 1);
+            close(fd);
+            if (n > 0) {
+                if (strstr(pname, "blue") || strstr(pname, "emu") ||
+                    strstr(pname, "virtual") || strstr(pname, "nox") ||
+                    strstr(pname, "mumu") || strstr(pname, "ldplayer")) {
+                    score->emulator_score = 0.5f;
+                }
+            }
+        }
+    }
+    {
+        char line[256];
+        FILE *fp = fopen("/proc/self/status", "r");
+        if (fp) {
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "TracerPid:")) {
+                    int tp = 0;
+                    if (sscanf(line, "TracerPid:\t%d", &tp) == 1 && tp > 0)
+                        score->debugger_score = 0.8f;
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+    }
+
+    score->overall_score = (score->root_score + score->frida_score +
+                           score->xposed_score + score->emulator_score +
+                           score->debugger_score) / 5.0f;
+
+    snprintf(score->recommendations, sizeof(score->recommendations),
+             "Recommendations:\n"
+             "- Root risk: %.0f%%\n"
+             "- Frida risk: %.0f%%\n"
+             "- Xposed risk: %.0f%%\n"
+             "- Emulator risk: %.0f%%\n"
+             "- Debugger risk: %.0f%%\n"
+             "- Overall: %.0f%%",
+             score->root_score * 100, score->frida_score * 100,
+             score->xposed_score * 100, score->emulator_score * 100,
+             score->debugger_score * 100,
+             score->overall_score * 100);
+
+    return VIRT_OK;
+}
+
+void virt_detection_score_log(void) {
+    VIRT_DetectionScore score;
+    if (virt_compute_detection_score(&score) != VIRT_OK) return;
+    VIRT_LOGI("Detection Score Report:\n%s", score.recommendations);
+    if (score.overall_score > 0.3f) {
+        VIRT_LOGW("Detection risk elevated: %.0f%% overall", score.overall_score * 100);
+    } else if (score.overall_score > 0.6f) {
+        VIRT_LOGE("Detection risk CRITICAL: %.0f%% overall", score.overall_score * 100);
+    }
+}
+
 int virt_anti_tamper_loop(void *arg) {
     (void)arg;
     prctl(PR_SET_NAME, "anti-tamper", 0, 0, 0);
-    VIRT_AntiTamperState state;
-    virt_anti_tamper_init(&state);
+    virt_anti_tamper_init(&g_anti_tamper_state);
 
     VIRT_LOGI("Anti-tamper loop started (interval=30s)");
     uint64_t last_mem_check = 0;
@@ -2280,8 +2457,8 @@ int virt_anti_tamper_loop(void *arg) {
             virt_log_tamper_warning(warn);
         }
 
-        virt_anti_tamper_check_memory(&state);
-        virt_anti_tamper_check_code(&state);
+        virt_anti_tamper_check_memory(&g_anti_tamper_state);
+        virt_anti_tamper_check_code(&g_anti_tamper_state);
 
         if (virt_scan_for_frida()) {
             VIRT_LOGW("Anti-tamper: Frida detected in process!");
@@ -2294,10 +2471,14 @@ int virt_anti_tamper_loop(void *arg) {
         virt_hide_from_frida();
         virt_hide_from_xposed();
 
+        virt_anti_tamper_check_self();
+
+        virt_detection_score_log();
+
         virt_rotate_log("/data/local/tmp/virtualizer/tamper_warnings.log", 524288);
 
-        state.total_checks++;
-        state.last_check_ns = virt_gettime_ns();
+        g_anti_tamper_state.total_checks++;
+        g_anti_tamper_state.last_check_ns = virt_gettime_ns();
     }
     return 0;
 }
