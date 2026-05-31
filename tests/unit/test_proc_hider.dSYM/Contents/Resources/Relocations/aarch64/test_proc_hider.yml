@@ -1,5 +1,0 @@
----
-triple:          'arm64-apple-darwin'
-binary-path:     'unit/test_proc_hider'
-relocations:     []
-...

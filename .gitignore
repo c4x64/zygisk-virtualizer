@@ -20,3 +20,4 @@ dist/
 *.sha256
 AGENTS.md
 
+*.dSYM/
