@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef VIRTUALIZER_H
 #define VIRTUALIZER_H
 
@@ -274,6 +275,10 @@
 
 #ifndef __NR_prctl
 #define __NR_prctl 167
+#endif
+
+#ifndef __NR_uname
+#define __NR_uname 160
 #endif
 
 #ifndef __NR_process_vm_readv
@@ -678,6 +683,7 @@ enum VIRT_SYSCALL_NR : int {
     VIRT_NR_socket          = 198,
     VIRT_NR_ioctl           = 29,
     VIRT_NR_prctl           = 167,
+    VIRT_NR_uname           = 160,
     VIRT_NR_clone3          = 435,
     VIRT_NR_exit_group      = 94,
     VIRT_NR_getdents        = 78,
@@ -1255,6 +1261,7 @@ static const VIRT_SeccompFilterProfile DEFAULT_FILTER_PROFILES[] = {
     { __NR_socket,        VIRT_CAT_NETWORK,    false, "socket"        },
     { __NR_ioctl,         VIRT_CAT_DEBUG,      false, "ioctl"         },
     { __NR_prctl,         VIRT_CAT_DEBUG,      true,  "prctl"         },
+    { __NR_uname,         VIRT_CAT_OTHER,      true,  "uname"         },
     { -1,                 VIRT_CAT_OTHER,      false, "terminator"    },
 };
 
@@ -1469,6 +1476,15 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "/proc/uptime",
     "/proc/stat",
     "/proc/self/attr/current",
+    "/proc/self/task/self",
+    "/proc/self/numa_maps",
+    "/proc/self/clear_refs",
+    "/proc/self/timers",
+    "/proc/self/timerslack_ns",
+    "/proc/self/sessionid",
+    "/proc/self/loginuid",
+    "/proc/self/latency",
+    "/proc/self/auxv",
     NULL,
 };
 
@@ -1655,6 +1671,7 @@ static inline bool virt_is_syscall_intercepted(int nr) {
         case __NR_mmap:
         case __NR_mprotect:
         case __NR_connect:
+        case __NR_uname:
             return true;
         default:
             return false;
@@ -1698,6 +1715,7 @@ static inline const char *virt_syscall_name(int nr) {
         case __NR_statfs:     return "statfs";
         case __NR_fcntl:      return "fcntl";
         case __NR_dup3:       return "dup3";
+        case __NR_uname:      return "uname";
         default:              return "unknown";
     }
 }
@@ -1853,6 +1871,7 @@ void virt_handle_prctl(struct seccomp_notif *req,
                        struct seccomp_notif_resp *resp);
 long virt_seccomp_execute_syscall(struct seccomp_notif *req);
 int virt_seccomp_handler_loop(void *arg);
+int virt_seccomp_start_handler_monitor(int notify_fd);
 int virt_seccomp_check_notif_id_valid(int notify_fd, uint64_t id);
 uint64_t virt_seccomp_get_event_count(void);
 uint64_t virt_seccomp_get_error_count(void);

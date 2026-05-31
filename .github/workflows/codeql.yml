@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - language: cpp
-            build-mode: autobuild
+            build-mode: manual
 
     steps:
       - name: Checkout repository
@@ -53,8 +53,7 @@ jobs:
               - 'jni/'
               - 'obj/'
 
-      - name: Setup build environment
-        if: matrix.build-mode == 'autobuild'
+      - name: Setup Android NDK
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq unzip curl
@@ -68,7 +67,9 @@ jobs:
             unzip -q /tmp/ndk.zip -d /opt/
             rm -f /tmp/ndk.zip
           fi
-          
+
+      - name: Setup JNI symlinks
+        run: |
           mkdir -p jni
           ln -sf "$PWD/zygisk_entry.cpp" jni/zygisk_entry.cpp
           ln -sf "$PWD/seccomp_engine.cpp" jni/seccomp_engine.cpp
@@ -79,7 +80,6 @@ jobs:
           ln -sf "$PWD/Application.mk" jni/Application.mk
 
       - name: Build for CodeQL analysis
-        if: matrix.build-mode == 'autobuild'
         env:
           NDK_PROJECT_PATH: ${{ github.workspace }}
         run: |

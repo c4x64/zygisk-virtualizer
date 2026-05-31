@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+//
 // Test compatibility header
 // Provides stubs for Android/Linux-specific features when
 // compiling unit tests on macOS (host machine).
@@ -14,41 +16,34 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 
-// Stub out Android logging
-#ifndef ANDROID_LOG_DEBUG
-#define ANDROID_LOG_DEBUG 3
-#endif
-#ifndef ANDROID_LOG_INFO
-#define ANDROID_LOG_INFO 4
-#endif
-#ifndef ANDROID_LOG_WARN
-#define ANDROID_LOG_WARN 5
-#endif
-#ifndef ANDROID_LOG_ERROR
-#define ANDROID_LOG_ERROR 6
-#endif
-#ifndef ANDROID_LOG_VERBOSE
-#define ANDROID_LOG_VERBOSE 2
+// Ensure Linux kernel integer types are available
+#ifndef __KERNEL__
+#if !defined(__u8) && !defined(__U8_TYPE)
+typedef uint8_t  __u8;
+typedef uint16_t __u16;
+typedef uint32_t __u32;
+typedef uint64_t __u64;
+typedef int8_t   __s8;
+typedef int16_t  __s16;
+typedef int32_t  __s32;
+typedef int64_t  __s64;
 #endif
 
-static inline int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
-    (void)prio; (void)tag;
-    va_list args;
-    va_start(args, fmt);
-    int ret = vfprintf(stderr, fmt, args);
-    va_end(args);
-    fprintf(stderr, "\n");
-    return ret;
-}
+#endif // __KERNEL__
 
 // Stub Linux-specific ioctl / seccomp types
+// Only define if NDK headers are not present
 #ifndef _LINUX_SECCOMP_H
-struct seccomp_notif { __u64 id; __u32 pid; __u32 flags; struct seccomp_data data; };
-struct seccomp_notif_resp { __u64 id; __s32 val; __u32 error; __u32 flags; };
+#define _LINUX_SECCOMP_H 1
 struct seccomp_data { int nr; __u32 arch; __u64 instruction_pointer; __u64 args[6]; };
+struct seccomp_notif { __u64 id; __u32 pid; __u32 flags; struct seccomp_data data; };
+struct seccomp_notif_resp { __u64 id; __s64 val; __s32 error; __u32 flags; };
 #endif
 
 #ifndef SECCOMP_SET_MODE_FILTER

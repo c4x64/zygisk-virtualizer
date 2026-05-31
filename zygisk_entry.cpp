@@ -1,4 +1,6 @@
 /*
+ * SPDX-License-Identifier: MIT
+ *
  * zygisk_entry.cpp - Universal Syscall Virtualization Framework
  * Zygisk Module Entry Point
  *
@@ -319,6 +321,8 @@ install_seccomp:
             return;
         }
 
+        virt_seccomp_start_handler_monitor(fd);
+
         VIRT_ZYGISK_LOGI("Virtualization active for %s (fd=%d, stack=%zuKB)",
                          proc_name, fd, stack_size / 1024);
     }
@@ -357,6 +361,9 @@ install_seccomp:
         }
         pthread_attr_destroy(&attr);
         g_virt_app_count++;
+
+        virt_seccomp_start_handler_monitor(fd);
+
         VIRT_ZYGISK_LOGI("Virtualization active for %s (fd=%d)", proc_name, fd);
     }
 

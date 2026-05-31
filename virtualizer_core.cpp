@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "virtualizer.h"
 
 #define VIRT_BLOOM_SIZE 1024
@@ -12,6 +13,7 @@ static uint32_t g_error_counts[VIRT_ERR_COUNT_MAX] = {0};
         __sync_fetch_and_add(&g_error_counts[_idx], 1); \
 } while (0)
 
+// Print a summary of error counters across all categories.
 void virt_print_error_summary(void) {
     VIRT_LOGI("Error summary: %u OOM, %u INVAL, %u TIMEOUT, %u NODEV, "
               "%u CORRUPT, %u IO, %u BUSY, %u CONFIG, %u BPF, %u SECCOMP",
@@ -43,6 +45,8 @@ static uint32_t virt_bloom_hash2(const char *str, uint32_t len) {
     return hash % VIRT_BLOOM_SIZE;
 }
 
+// Add a pattern string to the bloom filter.
+// @param pattern - non-null string to add
 void virt_bloom_add(const char *pattern) {
     uint32_t len = strlen(pattern);
     uint32_t h1 = virt_bloom_hash1(pattern, len);
@@ -51,6 +55,10 @@ void virt_bloom_add(const char *pattern) {
     g_bloom_filter[h2 / 64] |= (1ULL << (h2 % 64));
 }
 
+// Check if a string might be in the bloom filter (false positives possible).
+// @param str - string to check
+// @param len - length of string
+// @return 1 if possibly present, 0 if definitely absent
 int virt_bloom_check(const char *str, uint32_t len) {
     uint32_t h1 = virt_bloom_hash1(str, len);
     uint32_t h2 = virt_bloom_hash2(str, len);
@@ -108,6 +116,11 @@ static void trie_node_free_recursive(TrieNode *node) {
     __sync_fetch_and_sub(&g_trie_node_count, 1);
 }
 
+// Insert a path into the trie with a given action and priority.
+// @param path - slash-prefixed path string (non-null, non-empty)
+// @param action - VIRT_ACTION to associate
+// @param priority - higher priority overrides lower
+// @return VIRT_OK on success, VIRT_ERR on failure
 int virt_trie_insert(const char *path, int action, uint32_t priority) {
     if (!path || !path[0]) { VIRT_INC_ERR(VIRT_ERR_INVAL); return VIRT_ERR_INVAL; }
 
@@ -126,6 +139,7 @@ int virt_trie_insert(const char *path, int action, uint32_t priority) {
         if (!node->children[c]) {
             node->children[c] = trie_node_alloc((char)c);
             if (!node->children[c]) { pthread_mutex_unlock(&g_trie_lock); VIRT_INC_ERR(VIRT_ERR_NOMEM); return VIRT_ERR_NOMEM; }
+            assert(node->children[c] != NULL);
             if (node != g_trie_root && node->fallback) {
                 TrieNode *fb = node->fallback;
                 while (fb && !fb->children[c]) fb = fb->fallback;
@@ -135,6 +149,7 @@ int virt_trie_insert(const char *path, int action, uint32_t priority) {
                 node->children[c]->fallback = g_trie_root;
             }
         }
+        assert(node->children[c] != NULL);
         node = node->children[c];
     }
 
@@ -149,8 +164,14 @@ int virt_trie_insert(const char *path, int action, uint32_t priority) {
     return VIRT_OK;
 }
 
+// Look up a path in the trie and retrieve the best-matching action.
+// @param path - path to look up (non-null)
+// @param path_len - length of path
+// @param out_action - receives the matched action
+// @return VIRT_OK on match, VIRT_ERR_NOENT on no match, VIRT_ERR_INVAL on bad args
 int virt_trie_lookup(const char *path, size_t path_len, int *out_action) {
     if (!path || !out_action) return VIRT_ERR_INVAL;
+    assert(path_len > 0);
     *out_action = VIRT_ACTION_PASS_THROUGH;
 
     __sync_fetch_and_add(&g_trie_total_lookups, 1);
@@ -183,6 +204,8 @@ int virt_trie_lookup(const char *path, size_t path_len, int *out_action) {
     return VIRT_ERR_NOENT;
 }
 
+// Build the trie from VIRT_DEFAULT_BLOCKED_PATTERNS.
+// @return VIRT_OK on success
 int virt_trie_build_default(void) {
     int rc = VIRT_OK;
     for (size_t i = 0; VIRT_DEFAULT_BLOCKED_PATTERNS[i] != NULL; i++) {
@@ -205,6 +228,7 @@ int virt_trie_build_default(void) {
     return rc;
 }
 
+// Destroy the trie and free all nodes.
 void virt_trie_destroy(void) {
     pthread_mutex_lock(&g_trie_lock);
     if (g_trie_root) { trie_node_free_recursive(g_trie_root); g_trie_root = NULL; }
@@ -218,6 +242,9 @@ uint32_t virt_trie_get_node_count(void) {
     return g_trie_node_count;
 }
 
+// Initialize an event ring structure.
+// @param ring - ring to initialize (non-null)
+// @return VIRT_OK on success
 int virt_event_ring_init(VIRT_EventRing *ring) {
     if (!ring) return VIRT_ERR_INVAL;
     memset(ring, 0, sizeof(*ring));
@@ -228,6 +255,10 @@ int virt_event_ring_init(VIRT_EventRing *ring) {
     return VIRT_OK;
 }
 
+// Push an event onto the ring buffer.
+// @param ring - event ring (non-null)
+// @param evt - event to push (non-null)
+// @return VIRT_OK on success
 int virt_event_ring_push(VIRT_EventRing *ring, const VIRT_SyscallEvent *evt) {
     if (!ring || !evt) return VIRT_ERR_INVAL;
     ring->events[ring->write_pos] = *evt;
@@ -241,6 +272,10 @@ int virt_event_ring_push(VIRT_EventRing *ring, const VIRT_SyscallEvent *evt) {
     return VIRT_OK;
 }
 
+// Pop the oldest event from the ring buffer.
+// @param ring - event ring (non-null)
+// @param evt - receives the popped event (non-null)
+// @return VIRT_OK on success, VIRT_ERR_NOENT if empty
 int virt_event_ring_pop(VIRT_EventRing *ring, VIRT_SyscallEvent *evt) {
     if (!ring || !evt || ring->count == 0) return VIRT_ERR_NOENT;
     *evt = ring->events[ring->read_pos];
@@ -723,8 +758,15 @@ int virt_stats_snapshot(const VIRT_SyscallStats *stats, char *buf, size_t buf_si
     return VIRT_MIN(off, (int)buf_size - 1);
 }
 
+// Look up a path in the cache.
+// @param cache - cache array (non-null)
+// @param cache_count - number of valid entries
+// @param path - path to look up
+// @param path_len - length of path
+// @return cached action on hit, VIRT_ERR_NOENT on miss, VIRT_ERR_INVAL on bad args
 int virt_cache_lookup(VIRT_CacheEntry *cache, uint32_t cache_count, const char *path, uint32_t path_len) {
     if (!cache || !path || !path_len) return VIRT_ERR_INVAL;
+    assert(path_len <= VIRT_PATH_BUF_SIZE);
     uint64_t now = virt_gettime_ns();
     for (uint32_t i = 0; i < cache_count; i++) {
         if (!cache[i].valid) continue;
@@ -737,8 +779,18 @@ int virt_cache_lookup(VIRT_CacheEntry *cache, uint32_t cache_count, const char *
     return VIRT_ERR_NOENT;
 }
 
+// Insert a path into the cache (evicting oldest entry if full).
+// @param cache - cache array (non-null)
+// @param cache_count - in/out count of entries (non-null)
+// @param cache_max - maximum capacity
+// @param path - path to cache
+// @param path_len - length of path
+// @param sensitive - whether action is sensitive (non-pass-through)
+// @param action - action to cache
+// @return VIRT_OK on success
 int virt_cache_insert(VIRT_CacheEntry *cache, uint32_t *cache_count, uint32_t cache_max, const char *path, uint32_t path_len, bool sensitive, int action) {
     if (!cache || !cache_count || !path || !path_len) return VIRT_ERR_INVAL;
+    assert(cache_max > 0);
     uint32_t idx;
     if (*cache_count < cache_max) { idx = (*cache_count)++; }
     else {
@@ -788,8 +840,16 @@ int virt_rules_remove(VIRT_Rule *rules, uint32_t *rule_count, uint32_t index) {
     (*rule_count)--; return VIRT_OK;
 }
 
+// Find the highest-priority rule matching a path.
+// @param rules - rule array (non-null)
+// @param rule_count - number of rules
+// @param path - path to match
+// @param path_len - length of path
+// @param out_action - receives best action (non-null)
+// @return VIRT_OK on match, VIRT_ERR_NOENT on no match
 int virt_rules_lookup(const VIRT_Rule *rules, uint32_t rule_count, const char *path, uint32_t path_len, int *out_action) {
     if (!rules || !path || !out_action) return VIRT_ERR_INVAL;
+    assert(rule_count <= VIRT_MAX_RULES);
     *out_action = VIRT_ACTION_PASS_THROUGH; int best = -1;
     for (uint32_t i = 0; i < rule_count; i++) {
         if (!rules[i].enabled) continue;
@@ -1057,7 +1117,23 @@ int virt_anti_tamper_detect_hook(void) {
 int virt_config_load(const char *path, VIRT_Config *cfg) {
     if (!path || !cfg) return VIRT_ERR_INVAL;
     *cfg = VIRT_DEFAULT_CONFIG;
-    FILE *f = fopen(path, "r");
+
+    /* Try the configured path first, then fallback paths */
+    const char *paths[] = {
+        path,
+        "/data/local/tmp/virtualizer/config.txt",
+        "/data/local/tmp/virtualizer.conf",
+        NULL
+    };
+
+    FILE *f = NULL;
+    for (int i = 0; paths[i] != NULL; i++) {
+        f = fopen(paths[i], "r");
+        if (f) {
+            VIRT_LOGD("Config loaded from %s", paths[i]);
+            break;
+        }
+    }
     if (!f) return VIRT_OK;
     char line[1024]; int ln = 0;
     while (fgets(line, sizeof(line), f)) {
@@ -1868,6 +1944,69 @@ void virt_hide_from_xposed(void) {
     VIRT_LOGD("Xposed hide: periodic scan check");
 }
 
+static void virt_log_tamper_warning(const char *msg) {
+    mkdir("/data/local/tmp/virtualizer", 0755);
+    FILE *f = fopen("/data/local/tmp/virtualizer/tamper_warnings.log", "a");
+    if (!f) return;
+    uint64_t now_ns = virt_gettime_realtime_ns();
+    time_t sec = (time_t)(now_ns / 1000000000ULL);
+    struct tm tm;
+    localtime_r(&sec, &tm);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(f, "[%s] %s\n", timestamp, msg);
+    fflush(f);
+    fclose(f);
+}
+
+static void virt_rotate_log(const char *path, size_t max_bytes) {
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if ((size_t)st.st_size < max_bytes) return;
+    char tmp[VIRT_PATH_BUF_SIZE];
+    snprintf(tmp, sizeof(tmp), "%s.old", path);
+    rename(path, tmp);
+}
+
+static int virt_check_ld_preload(void) {
+    const char *ld = getenv("LD_PRELOAD");
+    if (!ld) return 0;
+    if (strstr(ld, "frida") || strstr(ld, "xposed") ||
+        strstr(ld, "substrate") || strstr(ld, "hook") ||
+        strstr(ld, "inject") || strstr(ld, "dobby") ||
+        strstr(ld, "bhook")) {
+        VIRT_LOGW("Tamper: LD_PRELOAD suspicious: %s", ld);
+        return 1;
+    }
+    return 0;
+}
+
+static int virt_check_suspicious_fds(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 0;
+    struct dirent *de;
+    int suspicious = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char link[VIRT_PATH_BUF_SIZE];
+        char path[VIRT_PATH_BUF_SIZE];
+        snprintf(path, sizeof(path), "/proc/self/fd/%s", de->d_name);
+        ssize_t n = readlink(path, link, sizeof(link) - 1);
+        if (n > 0) {
+            link[n] = '\0';
+            if (strstr(link, "frida") || strstr(link, "linjector") ||
+                strstr(link, "gdb") || strstr(link, "gdbserver") ||
+                strstr(link, "strace") || strstr(link, "ptrace") ||
+                strstr(link, "magisk") || strstr(link, "ksu")) {
+                VIRT_LOGW("Tamper: suspicious fd %s -> %s", de->d_name, link);
+                suspicious++;
+            }
+        }
+    }
+    closedir(d);
+    return suspicious;
+}
+
 int virt_anti_tamper_loop(void *arg) {
     (void)arg;
     prctl(PR_SET_NAME, "anti-tamper", 0, 0, 0);
@@ -1882,9 +2021,16 @@ int virt_anti_tamper_loop(void *arg) {
         int dbg = virt_anti_tamper_detect_debugger();
         int pt  = virt_anti_tamper_detect_ptrace();
         int hk  = virt_anti_tamper_detect_hook();
+        int ld  = virt_check_ld_preload();
+        int sfd = virt_check_suspicious_fds();
 
-        if (dbg > 0 || pt > 0 || hk > 0) {
-            VIRT_LOGW("Anti-tamper: dbg=%d pt=%d hooks=%d", dbg, pt, hk);
+        if (dbg > 0 || pt > 0 || hk > 0 || ld > 0 || sfd > 0) {
+            char warn[512];
+            snprintf(warn, sizeof(warn),
+                     "Tamper: dbg=%d pt=%d hooks=%d ld_preload=%d susp_fds=%d",
+                     dbg, pt, hk, ld, sfd);
+            VIRT_LOGW("%s", warn);
+            virt_log_tamper_warning(warn);
         }
 
         virt_anti_tamper_check_memory(&state);
@@ -1892,12 +2038,16 @@ int virt_anti_tamper_loop(void *arg) {
 
         if (virt_scan_for_frida()) {
             VIRT_LOGW("Anti-tamper: Frida detected in process!");
+            virt_log_tamper_warning("Frida detected in process");
         }
         if (virt_scan_for_xposed()) {
             VIRT_LOGW("Anti-tamper: Xposed detected in process!");
+            virt_log_tamper_warning("Xposed detected in process");
         }
         virt_hide_from_frida();
         virt_hide_from_xposed();
+
+        virt_rotate_log("/data/local/tmp/virtualizer/tamper_warnings.log", 524288);
 
         state.total_checks++;
         state.last_check_ns = virt_gettime_ns();

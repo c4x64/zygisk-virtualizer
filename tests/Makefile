@@ -13,26 +13,41 @@
 #       -std=c++17 -o test_trie test_trie.cpp ../../virtualizer_core.cpp
 
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -Wno-psabi -g -O0 \
-           -I. -I../.. \
+CXXFLAGS = -std=c++17 -Wall -Wextra -Wno-psabi -Wno-unused-parameter -g -O0 \
+           -I. -I../.. -Iandroid -I. \
            -DVIRT_LOG_LEVEL=0 \
-           -D__ANDROID_API__=30
+           -D__ANDROID_API__=30 \
+           -include test_compat.h
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 CXXFLAGS += -include test_compat.h
 endif
 
-all: test_trie test_cache test_rules
+SRCDIR := unit
+CORE := ../virtualizer_core.cpp
 
-test_trie: test_trie.cpp ../../virtualizer_core.cpp ../../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o test_trie test_trie.cpp ../../virtualizer_core.cpp
+all: $(SRCDIR)/test_trie $(SRCDIR)/test_cache $(SRCDIR)/test_rules \
+     $(SRCDIR)/test_config $(SRCDIR)/test_proc_hider $(SRCDIR)/test_stats
 
-test_cache: test_cache.cpp ../../virtualizer_core.cpp ../../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o test_cache test_cache.cpp ../../virtualizer_core.cpp
+$(SRCDIR)/test_trie: $(SRCDIR)/test_trie.cpp $(CORE) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
 
-test_rules: test_rules.cpp ../../virtualizer_core.cpp ../../virtualizer.h
-	$(CXX) $(CXXFLAGS) -o test_rules test_rules.cpp ../../virtualizer_core.cpp
+$(SRCDIR)/test_cache: $(SRCDIR)/test_cache.cpp $(CORE) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+
+$(SRCDIR)/test_rules: $(SRCDIR)/test_rules.cpp $(CORE) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+
+$(SRCDIR)/test_config: $(SRCDIR)/test_config.cpp $(CORE) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+
+$(SRCDIR)/test_proc_hider: $(SRCDIR)/test_proc_hider.cpp $(CORE) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
+
+$(SRCDIR)/test_stats: $(SRCDIR)/test_stats.cpp $(CORE) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE)
 
 clean:
-	rm -f test_trie test_cache test_rules
+	rm -f $(SRCDIR)/test_trie $(SRCDIR)/test_cache $(SRCDIR)/test_rules \
+	      $(SRCDIR)/test_config $(SRCDIR)/test_proc_hider $(SRCDIR)/test_stats

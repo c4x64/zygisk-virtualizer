@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "virtualizer.h"
 
 extern int virt_decoy_load_from_file(const char *filepath, char *out_buf, size_t buf_size);
@@ -238,9 +239,16 @@ static void bpf_compiler_init(BPFCompiler *c, sock_filter *buf, int max_insns,
     c->arch = AUDIT_ARCH_AARCH64;
 }
 
+// Emit a single BPF instruction into the compiler buffer.
+// @param c - compiler state (non-null)
+// @param code, jt, jf, k - BPF instruction fields
+// @return index of emitted instruction, or -1 on overflow
 static int bpf_compiler_emit(BPFCompiler *c, uint16_t code, uint8_t jt,
                               uint8_t jf, uint32_t k) {
+    assert(c != NULL);
     if (c->current >= c->max_instructions) return -1;
+    assert(c->instructions != NULL);
+    assert(c->current < c->max_instructions);
     int idx = c->current++;
     c->instructions[idx].code = code;
     c->instructions[idx].jt = jt;
@@ -338,6 +346,8 @@ static void __attribute__((unused)) bpf_compiler_dump(BPFCompiler *c) {
     }
 }
 
+// Probe kernel for seccomp features: USER_NOTIF, NEW_LISTENER, TSYNC, etc.
+// @return bitmask of detected feature flags
 static int virt_seccomp_probe_kernel_features(void) {
     int features = 0;
     struct sock_fprog prog;
@@ -413,6 +423,11 @@ static int virt_seccomp_probe_kernel_features(void) {
     return features;
 }
 
+// Install a static seccomp BPF filter with USER_NOTIF for intercepted syscalls.
+// @param cfg - configuration (non-null)
+// @param profiles - array of syscall profiles
+// @param profile_count - number of entries in profiles
+// @return notify_fd on success, or negative VIRT_ERR code
 int virt_seccomp_install_static(VIRT_Config *cfg,
                                 VIRT_SeccompFilterProfile *profiles,
                                 int profile_count) {
@@ -486,6 +501,8 @@ int virt_seccomp_install_static(VIRT_Config *cfg,
     return notify_fd;
 }
 
+// Create clean decoy files for sensitive /proc paths (maps, status, etc.).
+// @return number of decoy files successfully created
 int virt_seccomp_create_decoy_files(void) {
     int ok = 0;
     if (virt_decoy_file_create(VIRT_DECOY_MAPS_PATH, VIRT_FAKE_MAPS_CONTENT)) {
@@ -523,6 +540,9 @@ int virt_seccomp_create_decoy_files(void) {
     return ok;
 }
 
+// Install default BPF filter using DEFAULT_FILTER_PROFILES.
+// @param cfg - configuration
+// @return notify_fd on success, negative on failure
 int virt_seccomp_install_static_default(VIRT_Config *cfg) {
     return virt_seccomp_install_static(
         cfg,
@@ -660,12 +680,26 @@ static long virt_seccomp_execute_faccessat2(uint64_t a0, uint64_t a1,
 }
 
 static long virt_seccomp_execute_openat2(uint64_t a0, uint64_t a1,
-                                          uint64_t a2, uint64_t a3) {
+                                           uint64_t a2, uint64_t a3) {
     long ret = syscall(__NR_openat2, (int)a0, (const char *)(uintptr_t)a1,
                         (struct open_how *)(uintptr_t)a2, (size_t)a3);
     return (ret < 0) ? (long)-errno : ret;
 }
 
+static long virt_seccomp_execute_uname(uint64_t a0, pid_t target_pid) {
+    struct utsname uts;
+    long ret = syscall(__NR_uname, &uts);
+    if (ret < 0) return (long)-errno;
+    virt_spoof_uname(&uts);
+    struct iovec lw = { .iov_base = &uts, .iov_len = sizeof(uts) };
+    struct iovec rw = { .iov_base = (void *)(uintptr_t)a0, .iov_len = sizeof(uts) };
+    syscall(__NR_process_vm_writev, target_pid, &lw, 1UL, &rw, 1UL, 0UL);
+    return 0;
+}
+
+// Handle prctl syscall interception: spoof PR_GET_SECCOMP to hide seccomp state.
+// @param req - seccomp notification (non-null)
+// @param resp - response to fill (non-null)
 void virt_handle_prctl(struct seccomp_notif *req,
                         struct seccomp_notif_resp *resp) {
     if (!req || !resp) return;
@@ -687,6 +721,9 @@ void virt_handle_prctl(struct seccomp_notif *req,
     }
 }
 
+// Re-execute a syscall on behalf of the target process (fallback when CONTINUE unsupported).
+// @param req - seccomp notification (non-null)
+// @return syscall return value or negative errno
 long virt_seccomp_execute_syscall(struct seccomp_notif *req) {
     if (!req) return -EINVAL;
 
@@ -726,12 +763,20 @@ long virt_seccomp_execute_syscall(struct seccomp_notif *req) {
             return virt_seccomp_execute_mmap(a0, a1, a2, a3, a4, a5);
         case __NR_mprotect:
             return virt_seccomp_execute_mprotect(a0, a1, a2);
+        case __NR_uname:
+            return virt_seccomp_execute_uname(a0, pid);
         default:
             __sync_fetch_and_add(&g_seccomp_engine_errors, 1);
             return -ENOSYS;
     }
 }
 
+// Read a NUL-terminated path string from the target process's memory.
+// @param req - seccomp notification (non-null)
+// @param buf - output buffer (non-null)
+// @param buf_size - size of output buffer
+// @param path_addr - remote address to read from
+// @return string length on success, negative on error
 int virt_seccomp_read_path(struct seccomp_notif *req,
                             char *buf, size_t buf_size,
                             uint64_t path_addr) {
@@ -758,6 +803,10 @@ int virt_seccomp_read_path(struct seccomp_notif *req,
     return (int)n;
 }
 
+// Main seccomp notification handler loop: receives events, resolves rules, responds.
+// Runs in a dedicated detached thread per process.
+// @param arg - notify_fd as void* intptr
+// @return 0 on clean shutdown, VIRT_ERR on error
 int virt_seccomp_handler_loop(void *arg) {
     int notify_fd = (int)(intptr_t)arg;
     prctl(PR_SET_NAME, "seccomp-virt", 0, 0, 0);
@@ -796,6 +845,10 @@ int virt_seccomp_handler_loop(void *arg) {
         close(notify_fd);
         return VIRT_ERR_NOMEM;
     }
+    assert(cache != NULL);
+    assert(rules != NULL);
+    assert(stats != NULL);
+    assert(proc_hider != NULL);
 
     memset(&health, 0, sizeof(health));
     memset(&req, 0, sizeof(req));
@@ -991,8 +1044,9 @@ int virt_seccomp_handler_loop(void *arg) {
         }
 
         if (path_addr) {
+            assert(req.pid > 0);
             path_len = virt_seccomp_read_path(&req, path_buf,
-                                               256, path_addr);
+                                                256, path_addr);
             if (path_len > 0 && path_len < 256) path_buf[path_len] = '\0';
             else if (path_len >= 256) path_buf[255] = '\0';
             path_readable = (path_len > 0);
@@ -1094,6 +1148,34 @@ int virt_seccomp_handler_loop(void *arg) {
         }
 
         resp.id = req.id;
+
+        /* --- uname Spoof Engine ---
+         * Intercept __NR_uname to return a clean kernel identity,
+         * hiding kernel modifications from anti-cheat probes. */
+        if (req.data.nr == __NR_uname) {
+            struct utsname uname_buf;
+            memset(&uname_buf, 0, sizeof(uname_buf));
+            uint64_t buf_addr = req.data.args[0];
+            if (buf_addr) {
+                struct iovec local = { .iov_base = &uname_buf, .iov_len = sizeof(uname_buf) };
+                struct iovec remote = { .iov_base = (void *)(uintptr_t)buf_addr,
+                                        .iov_len = sizeof(uname_buf) };
+                ssize_t n = syscall(__NR_process_vm_readv, (pid_t)req.pid,
+                                    &local, 1UL, &remote, 1UL, 0UL);
+                if (n >= (ssize_t)sizeof(uname_buf)) {
+                    virt_spoof_uname(&uname_buf);
+                    struct iovec lw = { .iov_base = &uname_buf, .iov_len = sizeof(uname_buf) };
+                    syscall(__NR_process_vm_writev, (pid_t)req.pid,
+                            &lw, 1UL, &remote, 1UL, 0UL);
+                }
+            }
+            resp.id = req.id;
+            resp.error = 0;
+            resp.val = 0;
+            resp.flags = 0;
+            VIRT_LOGD("[uname] SPOOFED -> %s %s", uname_buf.sysname, uname_buf.release);
+            /* Skip further processing — response already set */
+        } else
 
         /* --- prctl Bypass Engine ---
          * Intercept PR_GET_SECCOMP to return SECCOMP_MODE_DISABLED (0),
@@ -1259,7 +1341,8 @@ int virt_seccomp_handler_loop(void *arg) {
         }
 
         if (!should_redirect) {
-            bool send_direct = (req.data.nr == __NR_prctl);
+            bool send_direct = (req.data.nr == __NR_prctl) ||
+                               (req.data.nr == __NR_uname);
             if (req.data.nr == __NR_mprotect) {
                 const ShadowLibraryMirror *sm = virt_get_shadow_mirror();
                 if (sm && sm->initialized &&
@@ -1683,5 +1766,85 @@ int virt_jitter_apply(VIRT_TimingJitter *jitter) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)val * 1000L };
         nanosleep(&ts, NULL);
     }
+    return VIRT_OK;
+}
+
+/* --- Handler Monitor Thread ---
+ * Periodically checks if the handler is still processing events.
+ * Logs warnings if handler idle > 30s or consecutive errors > 5. */
+
+static volatile int g_handler_monitor_notify_fd = -1;
+static volatile uint64_t g_handler_last_event_count = 0;
+static volatile uint64_t g_handler_last_error_count = 0;
+static volatile uint64_t g_handler_monitor_last_check = 0;
+
+static void *virt_handler_monitor_loop(void *arg) {
+    (void)arg;
+    prctl(PR_SET_NAME, "virt-monitor", 0, 0, 0);
+    VIRT_LOGI("Handler monitor thread started");
+
+    uint64_t idle_start = 0;
+    bool idle_warning_logged = false;
+
+    while (true) {
+        struct timespec ts = { .tv_sec = 10, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+
+        int fd = __sync_fetch_and_add(&g_handler_monitor_notify_fd, 0);
+        if (fd < 0) {
+            VIRT_LOGI("Handler monitor: notify_fd invalid, exiting");
+            break;
+        }
+
+        uint64_t events = __sync_fetch_and_add(&g_seccomp_engine_events, 0);
+        uint64_t errors = __sync_fetch_and_add(&g_seccomp_engine_errors, 0);
+        uint64_t now = virt_gettime_ns();
+
+        /* Check consecutive errors */
+        if (errors > g_handler_last_error_count + 5) {
+            VIRT_LOGE("Handler monitor: CRITICAL — consecutive errors exceeded 5 "
+                      "(events=%lu errors=%lu)", (unsigned long)events, (unsigned long)errors);
+            g_handler_last_error_count = errors;
+        }
+
+        /* Check if handler is idle */
+        if (events == g_handler_last_event_count) {
+            if (idle_start == 0) {
+                idle_start = now;
+                idle_warning_logged = false;
+            } else if ((now - idle_start) > (30ULL * VIRT_NS_PER_SEC) && !idle_warning_logged) {
+                VIRT_LOGW("Handler monitor: handler idle for >30s (events=%lu)",
+                          (unsigned long)events);
+                idle_warning_logged = true;
+            }
+        } else {
+            idle_start = 0;
+            idle_warning_logged = false;
+        }
+
+        g_handler_last_event_count = events;
+        g_handler_monitor_last_check = now;
+    }
+    return NULL;
+}
+
+int virt_seccomp_start_handler_monitor(int notify_fd) {
+    __sync_lock_test_and_set(&g_handler_monitor_notify_fd, notify_fd);
+    g_handler_last_event_count = 0;
+    g_handler_last_error_count = 0;
+
+    pthread_t monitor_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int ret = pthread_create(&monitor_thread, &attr,
+                              virt_handler_monitor_loop, NULL);
+    pthread_attr_destroy(&attr);
+
+    if (ret != 0) {
+        VIRT_LOGE("Failed to create handler monitor thread: %d", ret);
+        return VIRT_ERR_HANDLER;
+    }
+    VIRT_LOGI("Handler monitor started for fd=%d", notify_fd);
     return VIRT_OK;
 }
