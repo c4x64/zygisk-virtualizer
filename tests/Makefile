@@ -25,7 +25,8 @@ CORE := ../virtualizer_core.cpp
 
 all: $(SRCDIR)/test_trie $(SRCDIR)/test_cache $(SRCDIR)/test_rules \
      $(SRCDIR)/test_config $(SRCDIR)/test_proc_hider $(SRCDIR)/test_stats \
-     $(SRCDIR)/test_mem $(SRCDIR)/test_signal $(SRCDIR)/test_mask
+     $(SRCDIR)/test_mem $(SRCDIR)/test_signal $(SRCDIR)/test_mask \
+     $(SRCDIR)/test_features
 
 STUBS := test_stubs.cpp
 
@@ -56,7 +57,11 @@ $(SRCDIR)/test_signal: $(SRCDIR)/test_signal.cpp $(CORE) $(STUBS) ../virtualizer
 $(SRCDIR)/test_mask: $(SRCDIR)/test_mask.cpp $(CORE) $(STUBS) ../virtualizer.h
 	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
 
+$(SRCDIR)/test_features: $(SRCDIR)/test_features.cpp $(CORE) $(STUBS) ../virtualizer.h
+	$(CXX) $(CXXFLAGS) -o $@ $< $(CORE) $(STUBS)
+
 clean:
 	rm -f $(SRCDIR)/test_trie $(SRCDIR)/test_cache $(SRCDIR)/test_rules \
 	      $(SRCDIR)/test_config $(SRCDIR)/test_proc_hider $(SRCDIR)/test_stats \
-	      $(SRCDIR)/test_mem $(SRCDIR)/test_signal $(SRCDIR)/test_mask
+	      $(SRCDIR)/test_mem $(SRCDIR)/test_signal $(SRCDIR)/test_mask \
+	      $(SRCDIR)/test_features

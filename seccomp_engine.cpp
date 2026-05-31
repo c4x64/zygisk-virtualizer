@@ -197,6 +197,19 @@ const char *VIRT_DECOY_OSRELEASE_PATH = "/data/local/tmp/clean_osrelease";
 const char *VIRT_DECOY_OSTYPE_PATH = "/data/local/tmp/clean_ostype";
 const char *VIRT_DECOY_CPUINFO_PATH = "/data/local/tmp/clean_cpuinfo";
 const char *VIRT_DECOY_FAKE_EXE_PATH = "/data/local/tmp/virtualizer/fake_exe";
+const char *VIRT_DECOY_IO_PATH = "/data/local/tmp/virtualizer/fake_io";
+const char *VIRT_DECOY_OOM_PATH = "/data/local/tmp/virtualizer/fake_oom";
+const char *VIRT_DECOY_OOM_SCORE_PATH = "/data/local/tmp/virtualizer/fake_oom_score";
+const char *VIRT_DECOY_OOM_SCORE_ADJ_PATH = "/data/local/tmp/virtualizer/fake_oom_score_adj";
+const char *VIRT_DECOY_WCHAN_PATH = "/data/local/tmp/virtualizer/fake_wchan";
+const char *VIRT_DECOY_STACK_PATH = "/data/local/tmp/virtualizer/fake_stack";
+const char *VIRT_DECOY_SYSCALL_PATH = "/data/local/tmp/virtualizer/fake_syscall";
+const char *VIRT_DECOY_PERSONALITY_PATH = "/data/local/tmp/virtualizer/fake_personality";
+const char *VIRT_DECOY_COREDUMP_FILTER_PATH = "/data/local/tmp/virtualizer/fake_coredump_filter";
+const char *VIRT_DECOY_TIMERS_PATH = "/data/local/tmp/virtualizer/fake_timers";
+const char *VIRT_DECOY_LOGINUID_PATH = "/data/local/tmp/virtualizer/fake_loginuid";
+const char *VIRT_DECOY_SESSIONID_PATH = "/data/local/tmp/virtualizer/fake_sessionid";
+const char *VIRT_DECOY_COMM_PATH = "/data/local/tmp/virtualizer/fake_comm";
 
 static const char *VIRT_FAKE_MOUNTINFO_CONTENT[] = {
     "1 0 0:0 / / rw,relatime shared:1 - rootfs rootfs rw",
@@ -388,7 +401,7 @@ static void __attribute__((unused)) virt_seccomp_fatal_error(const char *msg, in
 
 static sock_filter g_bpf_filter_static[] = {
     {BPF_LD | BPF_W | BPF_ABS, 0, 0, 4},
-    {BPF_JMP | BPF_JEQ | BPF_K, 1, 0, AUDIT_ARCH_AARCH64},
+    {BPF_JMP | BPF_JEQ | BPF_K, 1, 0, VIRT_AUDIT_ARCH},
     {BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW},
     {BPF_LD | BPF_W | BPF_ABS, 0, 0, 0},
     {BPF_JMP | BPF_JEQ | BPF_K, 3, 0, __NR_faccessat},
@@ -441,7 +454,7 @@ static void bpf_compiler_init(BPFCompiler *c, sock_filter *buf, int max_insns,
     c->matched_nrs = nr_buf;
     c->max_matches = max_nrs;
     c->has_arch_check = true;
-    c->arch = AUDIT_ARCH_AARCH64;
+    c->arch = VIRT_AUDIT_ARCH;
 }
 
 // Emit a single BPF instruction into the compiler buffer.
@@ -573,6 +586,67 @@ static void __attribute__((unused)) bpf_compiler_dump(BPFCompiler *c) {
         VIRT_LOGT("  [%2d] %s jt=%u jf=%u k=%u (0x%x)",
                   i, op_name, f->jt, f->jf, f->k, f->k);
     }
+}
+
+#if defined(__x86_64__)
+// x86_64 syscall numbers:
+//   openat=257, readlinkat=267, newfstatat=262,
+//   getdents64=217, prctl=157, connect=42, uname=63
+static const VIRT_SeccompFilterProfile FILTER_PROFILES_X86_64[] = {
+    {257, VIRT_CAT_FILE_READ, true,  "openat"},
+    {267, VIRT_CAT_FILE_READ, true,  "readlinkat"},
+    {262, VIRT_CAT_FILE_META, true,  "newfstatat"},
+    {217, VIRT_CAT_FILE_READ, true,  "getdents64"},
+    {157, VIRT_CAT_DEBUG,     true,  "prctl"},
+    {42,  VIRT_CAT_NETWORK,   true,  "connect"},
+    {63,  VIRT_CAT_OTHER,     true,  "uname"},
+    {-1,  VIRT_CAT_OTHER,     false, "terminator"},
+};
+#endif
+
+#if defined(__arm__)
+// ARM (32-bit) syscall numbers
+static __attribute__((unused)) const VIRT_SeccompFilterProfile FILTER_PROFILES_ARM[] = {
+    {322, VIRT_CAT_FILE_READ, true,  "openat"},
+    {296, VIRT_CAT_FILE_READ, true,  "readlinkat"},
+    {327, VIRT_CAT_FILE_META, true,  "newfstatat"},
+    {217, VIRT_CAT_FILE_READ, true,  "getdents64"},
+    {172, VIRT_CAT_DEBUG,     true,  "prctl"},
+    {283, VIRT_CAT_NETWORK,   true,  "connect"},
+    {72,  VIRT_CAT_OTHER,     true,  "uname"},
+    {-1,  VIRT_CAT_OTHER,     false, "terminator"},
+};
+#endif
+
+static const VIRT_SeccompFilterProfile* virt_get_default_arm64_profiles(int *count) {
+    *count = (int)ARRAY_COUNT(DEFAULT_FILTER_PROFILES);
+    return DEFAULT_FILTER_PROFILES;
+}
+
+#if defined(__x86_64__)
+static const VIRT_SeccompFilterProfile* virt_get_default_x86_64_profiles(int *count) {
+    *count = (int)ARRAY_COUNT(FILTER_PROFILES_X86_64);
+    return FILTER_PROFILES_X86_64;
+}
+#endif
+
+#if defined(__arm__)
+static const VIRT_SeccompFilterProfile* virt_get_default_arm_profiles(int *count) {
+    *count = (int)ARRAY_COUNT(FILTER_PROFILES_ARM);
+    return FILTER_PROFILES_ARM;
+}
+#endif
+
+static const VIRT_SeccompFilterProfile* virt_get_profiles_for_arch(int *count) {
+#if defined(__aarch64__)
+    return virt_get_default_arm64_profiles(count);
+#elif defined(__x86_64__)
+    return virt_get_default_x86_64_profiles(count);
+#elif defined(__arm__)
+    return virt_get_default_arm_profiles(count);
+#else
+    return virt_get_default_arm64_profiles(count);
+#endif
 }
 
 // Probe kernel for seccomp features: USER_NOTIF, NEW_LISTENER, TSYNC, etc.
@@ -806,6 +880,78 @@ int virt_seccomp_create_decoy_files(void) {
         VIRT_LOGD("Decoy fake_exe created at %s", VIRT_DECOY_FAKE_EXE_PATH);
         ok++;
     }
+
+    static const char *VIRT_FAKE_IO_CONTENT[] = {
+        "rchar: 12345678",
+        "wchar: 9876543",
+        "read_bytes: 2345678",
+        "write_bytes: 876543",
+        NULL,
+    };
+    if (virt_decoy_file_create(VIRT_DECOY_IO_PATH, VIRT_FAKE_IO_CONTENT)) {
+        VIRT_LOGD("Decoy io created at %s", VIRT_DECOY_IO_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_OOM_CONTENT[] = {"0\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_OOM_PATH, VIRT_FAKE_OOM_CONTENT)) {
+        VIRT_LOGD("Decoy oom created at %s", VIRT_DECOY_OOM_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_OOM_SCORE_CONTENT[] = {"0\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_OOM_SCORE_PATH, VIRT_FAKE_OOM_SCORE_CONTENT)) {
+        VIRT_LOGD("Decoy oom_score created at %s", VIRT_DECOY_OOM_SCORE_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_OOM_SCORE_ADJ_CONTENT[] = {"0\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_OOM_SCORE_ADJ_PATH, VIRT_FAKE_OOM_SCORE_ADJ_CONTENT)) {
+        VIRT_LOGD("Decoy oom_score_adj created at %s", VIRT_DECOY_OOM_SCORE_ADJ_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_WCHAN_CONTENT[] = {"do_epoll_wait\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_WCHAN_PATH, VIRT_FAKE_WCHAN_CONTENT)) {
+        VIRT_LOGD("Decoy wchan created at %s", VIRT_DECOY_WCHAN_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_STACK_CONTENT[] = {"[<0>] __switch_to+0x70/0x80\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_STACK_PATH, VIRT_FAKE_STACK_CONTENT)) {
+        VIRT_LOGD("Decoy stack created at %s", VIRT_DECOY_STACK_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_SYSCALL_CONTENT[] = {"running\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_SYSCALL_PATH, VIRT_FAKE_SYSCALL_CONTENT)) {
+        VIRT_LOGD("Decoy syscall created at %s", VIRT_DECOY_SYSCALL_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_PERSONALITY_CONTENT[] = {"00000000\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_PERSONALITY_PATH, VIRT_FAKE_PERSONALITY_CONTENT)) {
+        VIRT_LOGD("Decoy personality created at %s", VIRT_DECOY_PERSONALITY_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_COREDUMP_FILTER_CONTENT[] = {"00000000\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_COREDUMP_FILTER_PATH, VIRT_FAKE_COREDUMP_FILTER_CONTENT)) {
+        VIRT_LOGD("Decoy coredump_filter created at %s", VIRT_DECOY_COREDUMP_FILTER_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_TIMERS_CONTENT[] = {"monotonic: 0\nreal: 0\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_TIMERS_PATH, VIRT_FAKE_TIMERS_CONTENT)) {
+        VIRT_LOGD("Decoy timers created at %s", VIRT_DECOY_TIMERS_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_LOGINUID_CONTENT[] = {"1000\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_LOGINUID_PATH, VIRT_FAKE_LOGINUID_CONTENT)) {
+        VIRT_LOGD("Decoy loginuid created at %s", VIRT_DECOY_LOGINUID_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_SESSIONID_CONTENT[] = {"1000\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_SESSIONID_PATH, VIRT_FAKE_SESSIONID_CONTENT)) {
+        VIRT_LOGD("Decoy sessionid created at %s", VIRT_DECOY_SESSIONID_PATH);
+        ok++;
+    }
+    static const char *VIRT_FAKE_COMM_CONTENT[] = {"app_process64\n", NULL};
+    if (virt_decoy_file_create(VIRT_DECOY_COMM_PATH, VIRT_FAKE_COMM_CONTENT)) {
+        VIRT_LOGD("Decoy comm created at %s", VIRT_DECOY_COMM_PATH);
+        ok++;
+    }
     return ok;
 }
 
@@ -813,10 +959,12 @@ int virt_seccomp_create_decoy_files(void) {
 // @param cfg - configuration
 // @return notify_fd on success, negative on failure
 int virt_seccomp_install_static_default(VIRT_Config *cfg) {
+    int profile_count = 0;
+    const VIRT_SeccompFilterProfile *profiles = virt_get_profiles_for_arch(&profile_count);
     return virt_seccomp_install_static(
         cfg,
-        (VIRT_SeccompFilterProfile *)DEFAULT_FILTER_PROFILES,
-        ARRAY_COUNT(DEFAULT_FILTER_PROFILES)
+        (VIRT_SeccompFilterProfile *)profiles,
+        profile_count
     );
 }
 
@@ -1179,6 +1327,22 @@ int virt_seccomp_read_path(struct seccomp_notif *req,
     return (int)n;
 }
 
+// Read raw bytes from a target process's memory using process_vm_readv.
+// @param target_pid - PID of the target process
+// @param remote_addr - remote address to read from
+// @param buf - local output buffer (non-null)
+// @param buf_size - number of bytes to read
+// @return number of bytes read on success, negative on error
+ssize_t virt_seccomp_read_mem(pid_t target_pid, uint64_t remote_addr,
+                               uint8_t *buf, size_t buf_size) {
+    if (!buf || !buf_size || !remote_addr || target_pid <= 0) return -EINVAL;
+    struct iovec local = { .iov_base = buf, .iov_len = buf_size };
+    struct iovec remote = { .iov_base = (void *)(uintptr_t)remote_addr,
+                            .iov_len = buf_size };
+    return syscall(__NR_process_vm_readv, (pid_t)target_pid,
+                   &local, 1UL, &remote, 1UL, 0UL);
+}
+
 // Main seccomp notification handler loop: receives events, resolves rules, responds.
 // Runs in a dedicated detached thread per process.
 // @param arg - notify_fd as void* intptr
@@ -1466,10 +1630,12 @@ int virt_seccomp_handler_loop(void *arg) {
                                                      &reload_cfg) == VIRT_OK) {
                                     virt_config_validate(&reload_cfg);
                                 }
+                                int profile_cnt = 0;
+                                const VIRT_SeccompFilterProfile *arch_profiles = virt_get_profiles_for_arch(&profile_cnt);
                                 int bpf_ret = virt_seccomp_compile_and_install(
                                     &reload_cfg,
-                                    (VIRT_SeccompFilterProfile *)DEFAULT_FILTER_PROFILES,
-                                    ARRAY_COUNT(DEFAULT_FILTER_PROFILES));
+                                    (VIRT_SeccompFilterProfile *)arch_profiles,
+                                    profile_cnt);
                                 if (bpf_ret >= 0) {
                                     VIRT_LOGI("Handler: SIGHUP BPF filter reloaded (fd=%d)",
                                               bpf_ret);
@@ -1830,6 +1996,32 @@ int virt_seccomp_handler_loop(void *arg) {
                     redirect_path = VIRT_DECOY_OSTYPE_PATH;
                 else if (strstr(path_buf, "cpuinfo"))
                     redirect_path = VIRT_DECOY_CPUINFO_PATH;
+                else if (strstr(path_buf, "/proc/self/io"))
+                    redirect_path = VIRT_DECOY_IO_PATH;
+                else if (strstr(path_buf, "/proc/self/oom_score_adj"))
+                    redirect_path = VIRT_DECOY_OOM_SCORE_ADJ_PATH;
+                else if (strstr(path_buf, "/proc/self/oom_score"))
+                    redirect_path = VIRT_DECOY_OOM_SCORE_PATH;
+                else if (strstr(path_buf, "/proc/self/oom"))
+                    redirect_path = VIRT_DECOY_OOM_PATH;
+                else if (strstr(path_buf, "/proc/self/wchan"))
+                    redirect_path = VIRT_DECOY_WCHAN_PATH;
+                else if (strstr(path_buf, "/proc/self/stack"))
+                    redirect_path = VIRT_DECOY_STACK_PATH;
+                else if (strstr(path_buf, "/proc/self/syscall"))
+                    redirect_path = VIRT_DECOY_SYSCALL_PATH;
+                else if (strstr(path_buf, "/proc/self/personality"))
+                    redirect_path = VIRT_DECOY_PERSONALITY_PATH;
+                else if (strstr(path_buf, "/proc/self/coredump_filter"))
+                    redirect_path = VIRT_DECOY_COREDUMP_FILTER_PATH;
+                else if (strstr(path_buf, "/proc/self/timers"))
+                    redirect_path = VIRT_DECOY_TIMERS_PATH;
+                else if (strstr(path_buf, "/proc/self/loginuid"))
+                    redirect_path = VIRT_DECOY_LOGINUID_PATH;
+                else if (strstr(path_buf, "/proc/self/sessionid"))
+                    redirect_path = VIRT_DECOY_SESSIONID_PATH;
+                else if (strstr(path_buf, "/proc/self/comm"))
+                    redirect_path = VIRT_DECOY_COMM_PATH;
                 if (redirect_path) {
                     int new_fd = virt_seccomp_try_addfd(notify_fd, &req,
                                                          redirect_path);
@@ -1946,10 +2138,59 @@ int virt_seccomp_handler_loop(void *arg) {
             /* resp is set; send_direct will send it below */
         }
 
+        /* --- perf_event_open Interception ---
+         * Block timing-related perf events (used by anti-cheat for PMC
+         * timing analysis and hardware breakpoint detection). Allow
+         * other perf events through. */
+        if (req.data.nr == __NR_perf_event_open) {
+            uint64_t attr_ptr = req.data.args[0];
+            pid_t target_pid = (pid_t)req.data.args[1];
+            bool perf_blocked = false;
+
+            if (attr_ptr) {
+                struct virt_perf_event_attr attr;
+                ssize_t n = virt_seccomp_read_mem(
+                    (pid_t)req.pid, attr_ptr,
+                    (uint8_t*)&attr, sizeof(attr));
+
+                if (n >= (ssize_t)sizeof(attr)) {
+                    if (attr.type == PERF_TYPE_HARDWARE ||
+                        attr.type == PERF_TYPE_SOFTWARE) {
+                        if (attr.config == PERF_COUNT_HW_CPU_CYCLES ||
+                            attr.config == PERF_COUNT_SW_CPU_CLOCK ||
+                            attr.config == PERF_COUNT_SW_TASK_CLOCK ||
+                            attr.config == PERF_COUNT_SW_DUMMY) {
+                            resp.error = -EACCES;
+                            resp.val = 0;
+                            resp.flags = 0;
+                            perf_blocked = true;
+                            VIRT_LOGD("[perf] Blocked timing event "
+                                      "(type=%u config=%llu pid=%d)",
+                                      attr.type,
+                                      (unsigned long long)attr.config,
+                                      target_pid);
+                        }
+                    }
+                } else {
+                    VIRT_LOGD("[perf] Could not read attr struct at 0x%llx "
+                              "(n=%zd)", (unsigned long long)attr_ptr, n);
+                }
+            }
+
+            if (!perf_blocked) {
+                /* Allow through */
+                resp.error = 0;
+                resp.val = 0;
+                resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            }
+            /* resp is set; flag so send_direct dispatches below */
+        }
+
         if (!should_redirect) {
             bool send_direct = (req.data.nr == __NR_prctl) ||
                                (req.data.nr == __NR_uname) ||
-                               (req.data.nr == __NR_ptrace);
+                               (req.data.nr == __NR_ptrace) ||
+                               (req.data.nr == __NR_perf_event_open);
             if (req.data.nr == __NR_mprotect) {
                 const ShadowLibraryMirror *sm = virt_get_shadow_mirror();
                 if (sm && sm->initialized &&

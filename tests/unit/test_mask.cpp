@@ -243,7 +243,8 @@ static void test_mask_environ_zygisk() {
 }
 
 static void test_mask_environ_preserves_normal() {
-    char buf[] = "HOME=/data\0PATH=/system/bin\0USER=shell\0\0";
+    char buf[256] = {};
+    memcpy(buf, "HOME=/data\0PATH=/system/bin\0USER=shell\0\0", 41);
     uint32_t buf_size = (uint32_t)sizeof(buf);
     int rc = virt_mask_environ(buf, buf_size);
     if (rc < 0) {
@@ -262,7 +263,8 @@ static void test_mask_environ_preserves_normal() {
 }
 
 static void test_mask_environ_containing_keyword() {
-    char buf[] = "SOME_VAR=/data/magisk\0HOME=/data\0\0";
+    char buf[256] = {};
+    memcpy(buf, "SOME_VAR=/data/magisk\0HOME=/data\0\0", 33);
     uint32_t buf_size = (uint32_t)sizeof(buf);
     int rc = virt_mask_environ(buf, buf_size);
     if (rc < 0) {
@@ -317,7 +319,8 @@ static void test_mask_environ_empty() {
 }
 
 static void test_mask_environ_xposed() {
-    char buf[] = "xposed=1\0ANDROID_DATA=/data\0\0";
+    char buf[256] = {};
+    memcpy(buf, "xposed=1\0ANDROID_DATA=/data\0\0", 29);
     uint32_t buf_size = (uint32_t)sizeof(buf);
     int rc = virt_mask_environ(buf, buf_size);
     if (rc < 0) {
@@ -339,7 +342,8 @@ static void test_mask_environ_xposed() {
 }
 
 static void test_mask_environ_frida() {
-    char buf[] = "frida=1\0HOME=/data\0\0";
+    char buf[256] = {};
+    memcpy(buf, "frida=1\0HOME=/data\0\0", 21);
     uint32_t buf_size = (uint32_t)sizeof(buf);
     int rc = virt_mask_environ(buf, buf_size);
     if (rc < 0) {
@@ -358,6 +362,215 @@ static void test_mask_environ_frida() {
         return;
     }
     printf("PASS: mask environ removes frida\n");
+}
+
+// --- Enhanced environ masking ---
+
+static void test_mask_environ_path_sbin() {
+    char buf[256] = {};
+    memcpy(buf, "PATH=/sbin:/system/bin:/system/xbin\0HOME=/data\0\0", 47);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ path sbin rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "PATH")) {
+        printf("FAIL: PATH should still be present\n");
+        failures++;
+        return;
+    }
+    if (environ_contains(buf, buf_size, "/sbin")) {
+        printf("FAIL: /sbin still present in PATH\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/system/bin")) {
+        printf("FAIL: /system/bin should be in PATH\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ PATH replaces /sbin\n");
+}
+
+static void test_mask_environ_path_su_bin() {
+    char buf[256] = {};
+    memcpy(buf, "PATH=/su/bin:/system/bin\0HOME=/data\0\0", 36);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ path su_bin rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "PATH")) {
+        printf("FAIL: PATH should still be present\n");
+        failures++;
+        return;
+    }
+    if (environ_contains(buf, buf_size, "/su/bin")) {
+        printf("FAIL: /su/bin still present in PATH\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/system/xbin")) {
+        printf("FAIL: /system/xbin should be in PATH\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ PATH replaces /su/bin\n");
+}
+
+static void test_mask_environ_tmpdir() {
+    char buf[256] = {};
+    memcpy(buf, "TMPDIR=/data/local/tmp\0HOME=/data\0\0", 35);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ tmpdir rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "TMPDIR")) {
+        printf("FAIL: TMPDIR should still be present\n");
+        failures++;
+        return;
+    }
+    if (environ_contains(buf, buf_size, "/data/local/tmp")) {
+        printf("FAIL: /data/local/tmp still present in TMPDIR\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/data/data/com.android.shell/cache")) {
+        printf("FAIL: TMPDIR should be rewired to com.android.shell/cache\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ TMPDIR rewire\n");
+}
+
+static void test_mask_environ_ld_library_path_magisk() {
+    char buf[256] = {};
+    memcpy(buf, "LD_LIBRARY_PATH=/vendor/lib64:/data/adb/modules:/system/lib64\0HOME=/data\0\0", 69);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ ld_library_path rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (environ_contains(buf, buf_size, "/data/adb")) {
+        printf("FAIL: /data/adb still present in LD_LIBRARY_PATH\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/vendor/lib64")) {
+        printf("FAIL: /vendor/lib64 should still be present\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/system/lib64")) {
+        printf("FAIL: /system/lib64 should still be present\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ LD_LIBRARY_PATH removes magisk\n");
+}
+
+static void test_mask_environ_home() {
+    char buf[256] = {};
+    memcpy(buf, "HOME=/data\0USER=shell\0\0", 24);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ home rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "HOME")) {
+        printf("FAIL: HOME should still be present\n");
+        failures++;
+        return;
+    }
+    if (environ_contains(buf, buf_size, "/data\0")) {
+        // Check it's not just "/data" exact
+        if (!environ_contains(buf, buf_size, "/data/data/com.android.shell")) {
+            printf("FAIL: HOME not rewired to com.android.shell\n");
+            failures++;
+            return;
+        }
+    }
+    printf("PASS: mask environ HOME rewire\n");
+}
+
+static void test_mask_environ_ash_standalone() {
+    char buf[256] = {};
+    memcpy(buf, "ASH_STANDALONE=1\0HOME=/data\0\0", 29);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ ash rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (environ_contains(buf, buf_size, "ASH_STANDALONE")) {
+        printf("FAIL: ASH_STANDALONE should be removed\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "HOME")) {
+        printf("FAIL: HOME should still be present\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ removes ASH_STANDALONE\n");
+}
+
+static void test_mask_environ_preserves_bootclasspath() {
+    char buf[256] = {};
+    memcpy(buf, "BOOTCLASSPATH=/system/framework/core.jar:/system/framework/framework.jar\0HOME=/data\0\0", 87);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ bootclasspath rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "BOOTCLASSPATH")) {
+        printf("FAIL: BOOTCLASSPATH should be preserved\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ preserves BOOTCLASSPATH\n");
+}
+
+static void test_mask_environ_path_no_sbin() {
+    char buf[256] = {};
+    memcpy(buf, "PATH=/system/bin:/system/xbin\0HOME=/data\0\0", 43);
+    uint32_t buf_size = (uint32_t)sizeof(buf);
+    int rc = virt_mask_environ(buf, buf_size);
+    if (rc < 0) {
+        printf("FAIL: mask_environ path no_sbin rc=%d\n", rc);
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "PATH")) {
+        printf("FAIL: PATH should still be present\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/system/bin")) {
+        printf("FAIL: /system/bin should be preserved\n");
+        failures++;
+        return;
+    }
+    if (!environ_contains(buf, buf_size, "/system/xbin")) {
+        printf("FAIL: /system/xbin should be preserved\n");
+        failures++;
+        return;
+    }
+    printf("PASS: mask environ PATH unchanged when clean\n");
 }
 
 // --- SELinux spoofing ---
@@ -472,6 +685,16 @@ int main() {
     test_mask_environ_empty();
     test_mask_environ_xposed();
     test_mask_environ_frida();
+
+    printf("\n--- Enhanced Environ Masking ---\n");
+    test_mask_environ_path_sbin();
+    test_mask_environ_path_su_bin();
+    test_mask_environ_tmpdir();
+    test_mask_environ_ld_library_path_magisk();
+    test_mask_environ_home();
+    test_mask_environ_ash_standalone();
+    test_mask_environ_preserves_bootclasspath();
+    test_mask_environ_path_no_sbin();
 
     printf("\n--- SELinux Spoofing ---\n");
     test_selinux_context_format();

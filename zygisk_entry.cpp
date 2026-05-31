@@ -294,6 +294,7 @@ install_seccomp:
         virt_seccomp_create_decoy_files();
 
         VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
+        virt_config_auto_tune(&cfg);
         int fd = virt_seccomp_install_static_default(&cfg);
         if (fd < 0) {
             VIRT_ZYGISK_LOGE("seccomp install failed for %s: %s", proc_name, strerror(errno));
@@ -344,6 +345,7 @@ install_seccomp:
 
         /* Apply package-specific profile if one exists */
         VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
+        virt_config_auto_tune(&cfg);
         VIRT_PackageProfile *profile = virt_config_find_package_profile(&cfg, proc_name);
         if (profile) {
             VIRT_ZYGISK_LOGI("Applying profile for %s (flags=0x%04x)",
@@ -374,6 +376,9 @@ install_seccomp:
             }
         }
 
+        virt_fingerprint_init(getpid());
+
+        virt_code_register_self();
         virt_seccomp_create_decoy_files();
 
         int fd = virt_seccomp_install_static_default(&cfg);

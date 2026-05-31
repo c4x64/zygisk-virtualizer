@@ -181,6 +181,20 @@
 #define EM_X86_64 62
 #endif
 
+#if defined(__aarch64__)
+#define VIRT_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#define VIRT_BPF_ARCH "arm64"
+#elif defined(__x86_64__)
+#define VIRT_AUDIT_ARCH AUDIT_ARCH_X86_64
+#define VIRT_BPF_ARCH "x86_64"
+#elif defined(__arm__)
+#define VIRT_AUDIT_ARCH AUDIT_ARCH_ARM
+#define VIRT_BPF_ARCH "arm"
+#else
+#define VIRT_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#define VIRT_BPF_ARCH "unknown"
+#endif
+
 #ifndef SYS_getcpu
 #define SYS_getcpu 168
 #endif
@@ -254,7 +268,115 @@
 #endif
 
 #ifndef __NR_getdents64
+#if defined(__arm__)
+#define __NR_getdents64 217
+#else
 #define __NR_getdents64 61
+#endif
+#endif
+
+#ifndef __NR_perf_event_open
+#if defined(__aarch64__)
+#define __NR_perf_event_open 241
+#elif defined(__arm__)
+#define __NR_perf_event_open 364
+#endif
+#endif
+
+#ifndef PERF_TYPE_HARDWARE
+#define PERF_TYPE_HARDWARE 0
+#endif
+#ifndef PERF_TYPE_SOFTWARE
+#define PERF_TYPE_SOFTWARE 1
+#endif
+#ifndef PERF_COUNT_HW_CPU_CYCLES
+#define PERF_COUNT_HW_CPU_CYCLES 0
+#endif
+#ifndef PERF_COUNT_SW_CPU_CLOCK
+#define PERF_COUNT_SW_CPU_CLOCK 0
+#endif
+#ifndef PERF_COUNT_SW_TASK_CLOCK
+#define PERF_COUNT_SW_TASK_CLOCK 1
+#endif
+#ifndef PERF_COUNT_SW_DUMMY
+#define PERF_COUNT_SW_DUMMY 9
+#endif
+
+#ifndef HAVE_VIRT_PERF_EVENT_ATTR
+#define HAVE_VIRT_PERF_EVENT_ATTR
+struct virt_perf_event_attr {
+    uint32_t type;
+    uint32_t size;
+    uint64_t config;
+    uint64_t sample_period;
+    uint64_t sample_type;
+    uint64_t read_format;
+    uint64_t disabled          : 1;
+    uint64_t inherit           : 1;
+    uint64_t pinned            : 1;
+    uint64_t exclusive         : 1;
+    uint64_t exclude_user      : 1;
+    uint64_t exclude_kernel    : 1;
+    uint64_t exclude_hv        : 1;
+    uint64_t exclude_idle      : 1;
+    uint64_t mmap              : 1;
+    uint64_t comm              : 1;
+    uint64_t freq              : 1;
+    uint64_t inherit_stat      : 1;
+    uint64_t enable_on_exec    : 1;
+    uint64_t task              : 1;
+    uint64_t watermark         : 1;
+    uint64_t precise_ip        : 2;
+    uint64_t mmap_data         : 1;
+    uint64_t sample_id_all     : 1;
+    uint64_t exclude_host      : 1;
+    uint64_t exclude_guest     : 1;
+    uint64_t exclude_callchain_kernel : 1;
+    uint64_t exclude_callchain_user   : 1;
+    uint64_t mmap2             : 1;
+    uint64_t comm_exec         : 1;
+    uint64_t use_clockid       : 1;
+    uint64_t context_switch    : 1;
+    uint64_t write_backward    : 1;
+    uint64_t namespaces        : 1;
+    uint64_t ksymbol           : 1;
+    uint64_t bpf_event         : 1;
+    uint64_t aux_output        : 1;
+    uint64_t cgroup            : 1;
+    uint64_t text_poke         : 1;
+    uint64_t build_id          : 1;
+    uint64_t inherit_thread    : 1;
+    uint64_t remove_on_exec    : 1;
+    uint64_t sig_on_oom        : 1;
+    uint64_t __reserved_1      : 26;
+    union {
+        uint32_t wakeup_events;
+        uint32_t wakeup_watermark;
+    };
+    uint32_t bp_type;
+    union {
+        uint64_t bp_addr;
+        uint64_t kprobe_func;
+        uint64_t uprobe_path;
+        uint64_t config1;
+    };
+    union {
+        uint64_t bp_len;
+        uint64_t kprobe_addr;
+        uint64_t probe_offset;
+        uint64_t config2;
+    };
+    uint64_t branch_sample_type;
+    uint64_t sample_regs_user;
+    uint32_t sample_stack_user;
+    int32_t  clockid;
+    uint64_t sample_regs_intr;
+    uint32_t aux_watermark;
+    uint16_t sample_max_stack;
+    uint16_t __reserved_2;
+    uint32_t aux_sample_size;
+    uint32_t __reserved_3;
+};
 #endif
 
 /* __NR_getdents not defined on ARM64 (only __NR_getdents64 exists) */
@@ -745,6 +867,7 @@ enum VIRT_SYSCALL_NR : int {
     VIRT_NR_exit            = 93,
     VIRT_NR_unlinkat        = 35,
     VIRT_NR_renameat2       = 276,
+    VIRT_NR_perf_event_open = 241,
 };
 
 enum VIRT_MATCH_TYPE : int {
@@ -976,6 +1099,8 @@ typedef struct VIRT_Config {
     bool enable_readlinkat_intercept;
     bool enable_connect_intercept;
     bool enable_mmap_intercept;
+    bool enable_extra_stealth;
+    bool enable_emulator_compat;
     uint32_t cache_size;
     uint32_t stats_window_sec;
     uint32_t watchdog_interval_sec;
@@ -1143,6 +1268,18 @@ typedef struct VIRT_AntiTamperState {
 
 extern VIRT_AntiTamperState g_anti_tamper_state;
 extern int g_virt_notify_fd;
+
+typedef struct {
+    uint32_t seed;
+    uint32_t state;
+    char suffix[16];
+} VIRT_Fingerprint;
+
+extern VIRT_Fingerprint g_fp;
+void virt_fingerprint_init(pid_t pid);
+uint32_t virt_fingerprint_rand(void);
+void virt_fingerprint_maps(char *buf, size_t buf_size);
+int virt_detect_shell_access(void);
 
 typedef struct VIRT_ProcHiderState {
     bool initialized;
@@ -1351,6 +1488,7 @@ static const VIRT_SeccompFilterProfile DEFAULT_FILTER_PROFILES[] = {
     { __NR_ptrace,        VIRT_CAT_DEBUG,      true,  "ptrace"        },
     { __NR_unlinkat,      VIRT_CAT_FILE_WRITE, true,  "unlinkat"      },
     { __NR_renameat2,     VIRT_CAT_FILE_WRITE, true,  "renameat2"     },
+    { __NR_perf_event_open, VIRT_CAT_DEBUG,    true,  "perf_event_open" },
     { -1,                 VIRT_CAT_OTHER,      false, "terminator"    },
 };
 
@@ -1429,6 +1567,8 @@ static const VIRT_Config VIRT_DEFAULT_CONFIG = {
     .enable_readlinkat_intercept = true,
     .enable_connect_intercept = true,
     .enable_mmap_intercept    = true,
+    .enable_extra_stealth     = false,
+    .enable_emulator_compat   = false,
     .cache_size               = VIRT_MAX_CACHED_PATHS,
     .stats_window_sec         = 60,
     .watchdog_interval_sec    = 5,
@@ -1576,6 +1716,8 @@ static const char *VIRT_DEFAULT_BLOCKED_PATTERNS[] = {
     "/proc/self/clear_refs",
     "/proc/self/timers",
     "/proc/self/timerslack_ns",
+    "/proc/self/oom",
+    "/proc/self/comm",
     "/proc/self/sessionid",
     "/proc/self/loginuid",
     "/proc/self/latency",
@@ -1823,6 +1965,7 @@ static inline bool virt_is_syscall_intercepted(int nr) {
         case __NR_ptrace:
         case __NR_unlinkat:
         case __NR_renameat2:
+        case __NR_perf_event_open:
             return true;
         default:
             return false;
@@ -1870,6 +2013,7 @@ static inline const char *virt_syscall_name(int nr) {
         case __NR_ptrace:     return "ptrace";
         case __NR_unlinkat:   return "unlinkat";
         case __NR_renameat2:  return "renameat2";
+        case __NR_perf_event_open: return "perf_event_open";
         default:              return "unknown";
     }
 }
@@ -1959,6 +2103,8 @@ int virt_config_add_package_profile(VIRT_Config *cfg, const char *package, uint3
 VIRT_PackageProfile *virt_config_find_package_profile(VIRT_Config *cfg, const char *package);
 int virt_run_self_test(void);
 int virt_config_generate_default(const char *path);
+int virt_config_auto_tune(VIRT_Config *cfg);
+int virt_read_property(const char *key, char *value, size_t value_size);
 int virt_stats_init(VIRT_SyscallStats *stats);
 int virt_stats_record(VIRT_SyscallStats *stats, int syscall,
                       int action, uint64_t latency);
@@ -2006,6 +2152,9 @@ int virt_anti_tamper_detect_ptrace(void);
 int virt_anti_tamper_detect_hook(void);
 int virt_anti_tamper_check_memory(VIRT_AntiTamperState *state);
 int virt_anti_tamper_check_code(VIRT_AntiTamperState *state);
+void virt_code_register_region(const char *name, uintptr_t start, uintptr_t end);
+int virt_code_verify_integrity(void);
+void virt_code_register_self(void);
 int virt_seccomp_get_features(int *out_features);
 int virt_seccomp_install_static(VIRT_Config *cfg,
                                  VIRT_SeccompFilterProfile *profiles,
@@ -2034,9 +2183,24 @@ extern const char *VIRT_DECOY_OSRELEASE_PATH;
 extern const char *VIRT_DECOY_OSTYPE_PATH;
 extern const char *VIRT_DECOY_CPUINFO_PATH;
 extern const char *VIRT_DECOY_FAKE_EXE_PATH;
+extern const char *VIRT_DECOY_IO_PATH;
+extern const char *VIRT_DECOY_OOM_PATH;
+extern const char *VIRT_DECOY_OOM_SCORE_PATH;
+extern const char *VIRT_DECOY_OOM_SCORE_ADJ_PATH;
+extern const char *VIRT_DECOY_WCHAN_PATH;
+extern const char *VIRT_DECOY_STACK_PATH;
+extern const char *VIRT_DECOY_SYSCALL_PATH;
+extern const char *VIRT_DECOY_PERSONALITY_PATH;
+extern const char *VIRT_DECOY_COREDUMP_FILTER_PATH;
+extern const char *VIRT_DECOY_TIMERS_PATH;
+extern const char *VIRT_DECOY_LOGINUID_PATH;
+extern const char *VIRT_DECOY_SESSIONID_PATH;
+extern const char *VIRT_DECOY_COMM_PATH;
 int virt_seccomp_read_path(struct seccomp_notif *req,
                              char *buf, size_t buf_size,
                              uint64_t path_addr);
+ssize_t virt_seccomp_read_mem(pid_t target_pid, uint64_t remote_addr,
+                               uint8_t *buf, size_t buf_size);
 void virt_handle_prctl(struct seccomp_notif *req,
                        struct seccomp_notif_resp *resp);
 long virt_seccomp_execute_syscall(struct seccomp_notif *req);

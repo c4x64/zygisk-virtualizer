@@ -27,6 +27,66 @@ static VIRT_MemoryStats g_mem_stats;
 int g_virt_notify_fd = -1;
 VIRT_AntiTamperState g_anti_tamper_state;
 
+// CRC-16/CCITT for quick code page integrity checks
+static uint16_t virt_crc16(const uint8_t *data, size_t len, uint16_t init) {
+    uint16_t crc = init;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+#define VIRT_CODE_REGIONS 8
+
+typedef struct {
+    const char *name;
+    uintptr_t start;
+    uintptr_t end;
+    uint16_t expected_crc;
+    bool verified;
+} VIRT_CodeRegion;
+
+static VIRT_CodeRegion g_code_regions[VIRT_CODE_REGIONS] = {};
+static int g_code_region_count = 0;
+
+void virt_code_register_region(const char *name, uintptr_t start, uintptr_t end) {
+    if (g_code_region_count >= VIRT_CODE_REGIONS) return;
+    int idx = g_code_region_count++;
+    g_code_regions[idx].name = name;
+    g_code_regions[idx].start = start;
+    g_code_regions[idx].end = end;
+    g_code_regions[idx].expected_crc = virt_crc16((const uint8_t*)start, end - start, 0);
+    g_code_regions[idx].verified = false;
+}
+
+int virt_code_verify_integrity(void) {
+    int modified = 0;
+    for (int i = 0; i < g_code_region_count; i++) {
+        uint16_t crc = virt_crc16((const uint8_t*)g_code_regions[i].start,
+                                  g_code_regions[i].end - g_code_regions[i].start, 0);
+        if (crc != g_code_regions[i].expected_crc) {
+            VIRT_LOGW("Code modified: %s (expected %04x got %04x)",
+                     g_code_regions[i].name,
+                     g_code_regions[i].expected_crc, crc);
+            g_code_regions[i].verified = false;
+            modified++;
+        } else {
+            g_code_regions[i].verified = true;
+        }
+    }
+    return modified;
+}
+
+void virt_code_register_self(void) {
+    VIRT_LOGI("Code integrity monitoring initialized");
+}
+
 void virt_mem_track_alloc(size_t size) {
     g_mem_stats.total_allocated += size;
     if (g_mem_stats.total_allocated > g_mem_stats.peak_allocated) {
@@ -2138,6 +2198,47 @@ void virt_hide_from_xposed(void) {
     VIRT_LOGD("Xposed hide: periodic scan check");
 }
 
+int virt_detect_shell_access(void) {
+    if (isatty(STDIN_FILENO) || isatty(STDOUT_FILENO) || isatty(STDERR_FILENO)) {
+        VIRT_LOGD("Terminal detected on stdio");
+        return 1;
+    }
+    extern char **environ;
+    for (int i = 0; environ[i]; i++) {
+        if (strncmp(environ[i], "SHELL=", 6) == 0 ||
+            strncmp(environ[i], "PS1=", 4) == 0 ||
+            strncmp(environ[i], "PS2=", 4) == 0 ||
+            strncmp(environ[i], "PROMPT_COMMAND=", 15) == 0 ||
+            strncmp(environ[i], "HISTFILE=", 9) == 0) {
+            VIRT_LOGW("Shell env detected: %s", environ[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+VIRT_Fingerprint g_fp;
+
+void virt_fingerprint_init(pid_t pid) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g_fp.seed = (uint32_t)(pid * 2654435761U + (uint32_t)ts.tv_nsec);
+    g_fp.state = g_fp.seed;
+    uint32_t r = virt_fingerprint_rand();
+    snprintf(g_fp.suffix, sizeof(g_fp.suffix), "%08x", r);
+    VIRT_LOGI("Fingerprint initialized: pid=%d seed=%08x", pid, g_fp.seed);
+}
+
+uint32_t virt_fingerprint_rand(void) {
+    g_fp.state = g_fp.state * 1103515245 + 12345;
+    return g_fp.state;
+}
+
+void virt_fingerprint_maps(char *buf, size_t buf_size) {
+    size_t len = strlen(buf);
+    snprintf(buf + len, buf_size - len, "# fp:%s\n", g_fp.suffix);
+}
+
 static void virt_log_tamper_warning(const char *msg) {
     mkdir("/data/local/tmp/virtualizer", 0755);
     FILE *f = fopen("/data/local/tmp/virtualizer/tamper_warnings.log", "a");
@@ -2403,6 +2504,7 @@ int virt_anti_tamper_loop(void *arg) {
 
     VIRT_LOGI("Anti-tamper loop started (interval=30s)");
     uint64_t last_mem_check = 0;
+    uint32_t integrity_check_count = 0;
     int socket_suspicion = 0;
     while (1) {
         struct timespec ts = { .tv_sec = 30, .tv_nsec = 0 };
@@ -2419,11 +2521,20 @@ int virt_anti_tamper_loop(void *arg) {
                       virt_mem_get_usage(), virt_mem_get_peak(), g_mem_stats.oom_count);
         }
 
+        integrity_check_count++;
+        if (integrity_check_count % 2 == 0) {
+            int modified = virt_code_verify_integrity();
+            if (modified > 0) {
+                VIRT_LOGW("Code integrity: %d regions modified", modified);
+            }
+        }
+
         int dbg = virt_anti_tamper_detect_debugger();
         int pt  = virt_anti_tamper_detect_ptrace();
         int hk  = virt_anti_tamper_detect_hook();
         int ld  = virt_check_ld_preload();
         int sfd = virt_check_suspicious_fds();
+        int sh  = virt_detect_shell_access();
 
         /* Socket scan for anti-cheat named sockets */
         VIRT_SocketInfo sockets[32];
@@ -2448,11 +2559,16 @@ int virt_anti_tamper_loop(void *arg) {
             VIRT_LOGD("Socket scan: %d total, %d anti-cheat", num_sockets, ac_sockets);
         }
 
-        if (dbg > 0 || pt > 0 || hk > 0 || ld > 0 || sfd > 0 || ac_sockets > 0) {
+        if (sh > 0) {
+            g_anti_tamper_state.tamper_count++;
+            VIRT_LOGW("Shell access detected via anti-tamper scan");
+        }
+
+        if (dbg > 0 || pt > 0 || hk > 0 || ld > 0 || sfd > 0 || sh > 0 || ac_sockets > 0) {
             char warn[512];
             snprintf(warn, sizeof(warn),
-                     "Tamper: dbg=%d pt=%d hooks=%d ld_preload=%d susp_fds=%d ac_sockets=%d (suspicion=%d)",
-                     dbg, pt, hk, ld, sfd, ac_sockets, socket_suspicion);
+                     "Tamper: dbg=%d pt=%d hooks=%d ld_preload=%d susp_fds=%d shell=%d ac_sockets=%d (suspicion=%d)",
+                     dbg, pt, hk, ld, sfd, sh, ac_sockets, socket_suspicion);
             VIRT_LOGW("%s", warn);
             virt_log_tamper_warning(warn);
         }
@@ -2597,13 +2713,97 @@ int virt_mask_cmdline(const char *input, uint32_t input_len,
     return (int)out_pos;
 }
 
+// Helper: replace occurrences of "old" with "new" in a value string.
+// Value is the portion after "=" of "KEY=value". Modifies in-place.
+// @return 1 if any replacement was made, 0 otherwise
+static int virt_replace_path_entries(char *value, size_t value_max,
+                                      const char *old_entry, const char *new_entry) {
+    int replaced = 0;
+    size_t old_len = strlen(old_entry);
+    size_t new_len = strlen(new_entry);
+
+    char *p = value;
+    while (*p) {
+        char *found = strstr(p, old_entry);
+        if (!found) break;
+        /* Check boundary: found must be at start of a colon-delimited segment */
+        bool at_start = (found == value || found[-1] == ':');
+        if (!at_start) {
+            p = found + 1;
+            continue;
+        }
+        size_t tail = strlen(found + old_len);
+        if (new_len > old_len) {
+            /* Need to shift right */
+            size_t shift = new_len - old_len;
+            if (strlen(value) + shift + 1 > value_max) {
+                p = found + 1;
+                continue;
+            }
+            memmove(found + new_len, found + old_len, tail + 1);
+        } else if (old_len > new_len) {
+            /* Shift left */
+            memmove(found + new_len, found + old_len, tail + 1);
+        }
+        memcpy(found, new_entry, new_len);
+        replaced = 1;
+        p = found + new_len;
+    }
+    return replaced;
+}
+
+// Helper: remove all entries matching a substring from a colon-separated value
+// by compacting the string in-place.
+// @return 1 if any entry was removed, 0 otherwise
+static int virt_remove_path_entries(char *value, size_t value_max,
+                                     const char *substr) {
+    (void)value_max;
+    int removed = 0;
+    size_t sub_len = strlen(substr);
+    char *src = value;
+    char *dst = value;
+
+    while (*src) {
+        /* Find the next colon-delimited segment */
+        char *seg_start = src;
+        char *seg_end = strchr(seg_start, ':');
+        size_t seg_len = seg_end ? (size_t)(seg_end - seg_start) : strlen(seg_start);
+        bool match = false;
+        /* Check if this segment contains the substring */
+        for (size_t i = 0; i + sub_len <= seg_len; i++) {
+            if (memcmp(seg_start + i, substr, sub_len) == 0) {
+                match = true;
+                break;
+            }
+        }
+        if (!match) {
+            /* Copy this segment */
+            if (dst != seg_start)
+                memmove(dst, seg_start, seg_len);
+            dst += seg_len;
+            if (seg_end) {
+                *dst++ = ':';
+            }
+        } else {
+            removed = 1;
+        }
+        if (seg_end)
+            src = seg_end + 1;
+        else
+            break;
+    }
+    *dst = '\0';
+    return removed;
+}
+
 int virt_mask_environ(char *buffer, uint32_t buffer_size) {
     if (!buffer || buffer_size == 0) return -1;
 
     static const char *sensitive_prefixes[] = {
         "LD_PRELOAD=", "LD_LIBRARY_PATH=", "MAGISK=", "MAGISKTMP=",
         "KSU=", "KSUSD=", "ZYGISK=", "APATCH=",
-        "DEXOADY=", "RIRU=", "SULIST=", NULL
+        "DEXOADY=", "RIRU=", "SULIST=",
+        "ASH_STANDALONE=", NULL
     };
     static const char *sensitive_containing[] = {
         "magisk", "ksu", "zygisk", "xposed", "frida",
@@ -2612,6 +2812,10 @@ int virt_mask_environ(char *buffer, uint32_t buffer_size) {
 
     uint32_t read_pos = 0;
     uint32_t write_pos = 0;
+
+    /* Deferred modifications that don't fit inline */
+    struct { char data[256]; uint32_t len; } deferred[8];
+    int deferred_count = 0;
 
     while (read_pos < buffer_size) {
         const char *entry = buffer + read_pos;
@@ -2625,30 +2829,144 @@ int virt_mask_environ(char *buffer, uint32_t buffer_size) {
         }
 
         bool sensitive = false;
+        bool modified = false;
+        char modified_entry[VIRT_PATH_BUF_SIZE];
+        uint32_t mod_len = 0;
 
-        for (int i = 0; sensitive_prefixes[i]; i++) {
-            size_t plen = strlen(sensitive_prefixes[i]);
-            if (entry_len >= plen && memcmp(entry, sensitive_prefixes[i], plen) == 0) {
-                sensitive = true;
+        /* Check for value-aware masking of specific env vars */
+        static const char *value_aware_vars[] = {
+            "PATH=", "LD_LIBRARY_PATH=", "TMPDIR=", "HOME=", NULL
+        };
+        for (int i = 0; value_aware_vars[i]; i++) {
+            size_t vlen = strlen(value_aware_vars[i]);
+            if (entry_len > vlen && memcmp(entry, value_aware_vars[i], vlen) == 0) {
+                const char *val = entry + vlen;
+                size_t val_len = entry_len - vlen;
+                if (val_len >= VIRT_PATH_BUF_SIZE) val_len = VIRT_PATH_BUF_SIZE - 1;
+
+                memcpy(modified_entry, entry, vlen);
+                memcpy(modified_entry + vlen, val, val_len);
+                modified_entry[vlen + val_len] = '\0';
+                mod_len = vlen + (uint32_t)val_len;
+
+                if (strcmp(value_aware_vars[i], "PATH=") == 0) {
+                    /* Replace /sbin with /system/bin and /su/bin with /system/xbin */
+                    int r1 = virt_replace_path_entries(modified_entry + vlen,
+                                                       VIRT_PATH_BUF_SIZE - vlen,
+                                                       "/sbin", "/system/bin");
+                    int r2 = virt_replace_path_entries(modified_entry + vlen,
+                                                       VIRT_PATH_BUF_SIZE - vlen,
+                                                       "/su/bin", "/system/xbin");
+                    modified = (r1 || r2);
+                } else if (strcmp(value_aware_vars[i], "LD_LIBRARY_PATH=") == 0) {
+                    /* Remove entries containing /data/adb */
+                    int r = virt_remove_path_entries(modified_entry + vlen,
+                                                      VIRT_PATH_BUF_SIZE - vlen,
+                                                      "/data/adb");
+                    modified = (r > 0);
+                } else if (strcmp(value_aware_vars[i], "TMPDIR=") == 0) {
+                    /* Rewire /data/local/tmp -> /data/data/com.android.shell/cache */
+                    if (strncmp(modified_entry + vlen, "/data/local/tmp",
+                                strlen("/data/local/tmp")) == 0) {
+                        size_t rest_len = strlen(modified_entry + vlen + strlen("/data/local/tmp"));
+                        size_t new_val_len = strlen("/data/data/com.android.shell/cache") + rest_len;
+                        if (new_val_len < VIRT_PATH_BUF_SIZE - vlen) {
+                            char tmp[VIRT_PATH_BUF_SIZE];
+                            memcpy(tmp, "/data/data/com.android.shell/cache",
+                                   strlen("/data/data/com.android.shell/cache"));
+                            memcpy(tmp + strlen("/data/data/com.android.shell/cache"),
+                                   modified_entry + vlen + strlen("/data/local/tmp"),
+                                   rest_len + 1);
+                            memcpy(modified_entry + vlen, tmp, new_val_len + 1);
+                            mod_len = vlen + (uint32_t)new_val_len;
+                            modified = true;
+                        }
+                    }
+                } else if (strcmp(value_aware_vars[i], "HOME=") == 0) {
+                    /* Rewire /data -> /data/data/com.android.shell */
+                    if (strcmp(modified_entry + vlen, "/data") == 0 ||
+                        strncmp(modified_entry + vlen, "/data", 5) == 0) {
+                        const char *new_home = "/data/data/com.android.shell";
+                        size_t new_home_len = strlen(new_home);
+                        if (new_home_len + 1 < VIRT_PATH_BUF_SIZE - vlen) {
+                            /* Preserve any suffix after /data */
+                            const char *rest = modified_entry + vlen + 5;
+                            size_t rest_len = strlen(rest);
+                            char tmp[VIRT_PATH_BUF_SIZE];
+                            memcpy(tmp, new_home, new_home_len);
+                            if (rest_len > 0) {
+                                memcpy(tmp + new_home_len, rest, rest_len);
+                                tmp[new_home_len + rest_len] = '\0';
+                            } else {
+                                tmp[new_home_len] = '\0';
+                            }
+                            size_t total = new_home_len + rest_len;
+                            if (total < VIRT_PATH_BUF_SIZE - vlen) {
+                                memcpy(modified_entry + vlen, tmp, total + 1);
+                                mod_len = vlen + (uint32_t)total;
+                                modified = true;
+                            }
+                        }
+                    }
+                }
                 break;
             }
         }
 
-        if (!sensitive) {
-            for (int i = 0; sensitive_containing[i]; i++) {
-                const char *kw = sensitive_containing[i];
-                size_t klen = strlen(kw);
-                for (uint32_t j = 0; j + klen <= entry_len; j++) {
-                    if (memcmp(entry + j, kw, klen) == 0) {
-                        sensitive = true;
-                        break;
-                    }
+        if (!modified) {
+            /* Check standard sensitive prefixes */
+            for (int i = 0; sensitive_prefixes[i]; i++) {
+                size_t plen = strlen(sensitive_prefixes[i]);
+                if (entry_len >= plen && memcmp(entry, sensitive_prefixes[i], plen) == 0) {
+                    sensitive = true;
+                    break;
                 }
-                if (sensitive) break;
+            }
+
+            /* Check sensitive-containing keywords */
+            if (!sensitive) {
+                for (int i = 0; sensitive_containing[i]; i++) {
+                    const char *kw = sensitive_containing[i];
+                    size_t klen = strlen(kw);
+                    for (uint32_t j = 0; j + klen <= entry_len; j++) {
+                        if (memcmp(entry + j, kw, klen) == 0) {
+                            sensitive = true;
+                            break;
+                        }
+                    }
+                    if (sensitive) break;
+                }
             }
         }
 
-        if (!sensitive) {
+        if (sensitive) {
+            /* Strip the entire entry */
+            read_pos += entry_len + 1;
+            continue;
+        }
+
+        if (modified) {
+            /* Check if writing modified entry would overwrite unread data */
+            uint32_t copy_len = mod_len;
+            uint32_t next_read = read_pos + entry_len + 1;
+            bool inline_ok = (write_pos + copy_len + 1 <= next_read) &&
+                             (write_pos + copy_len + 1 <= buffer_size);
+            if (inline_ok) {
+                memcpy(buffer + write_pos, modified_entry, copy_len);
+                write_pos += copy_len;
+                buffer[write_pos++] = '\0';
+            } else if (deferred_count < 8) {
+                /* Defer for post-processing pass */
+                uint32_t dc = VIRT_MIN(copy_len, (uint32_t)sizeof(deferred[0].data) - 1);
+                memcpy(deferred[deferred_count].data, modified_entry, dc);
+                deferred[deferred_count].data[dc] = '\0';
+                deferred[deferred_count].len = dc;
+                deferred_count++;
+                /* Don't write the original either — we'll append the mod */
+            }
+            /* If deferred array full, entry silently dropped */
+        } else {
+            /* Write the original entry */
             if (write_pos + entry_len + 1 <= buffer_size) {
                 memcpy(buffer + write_pos, entry, entry_len);
                 write_pos += entry_len;
@@ -2657,6 +2975,15 @@ int virt_mask_environ(char *buffer, uint32_t buffer_size) {
         }
 
         read_pos += entry_len + 1;
+    }
+
+    /* Append deferred modifications that were too long to write inline */
+    for (int i = 0; i < deferred_count; i++) {
+        if (write_pos + deferred[i].len + 1 <= buffer_size) {
+            memcpy(buffer + write_pos, deferred[i].data, deferred[i].len);
+            write_pos += deferred[i].len;
+            buffer[write_pos++] = '\0';
+        }
     }
 
     if (write_pos < buffer_size)
@@ -2991,4 +3318,83 @@ int virt_get_fake_cpuinfo(char *buf, size_t buf_size) {
     memcpy(buf, fake, copy);
     buf[copy] = '\0';
     return (int)copy;
+}
+
+int virt_read_property(const char *key, char *value, size_t value_size) {
+    if (!key || !value || value_size == 0) return -1;
+    FILE *f = fopen("/system/build.prop", "r");
+    if (!f) return -1;
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *val = eq + 1;
+        size_t len = strlen(val);
+        while (len > 0 && (val[len-1] == '\n' || val[len-1] == '\r')) val[--len] = '\0';
+        if (strcmp(line, key) == 0) {
+            strncpy(value, val, value_size - 1);
+            value[value_size - 1] = '\0';
+            found = 1;
+            break;
+        }
+        *eq = '=';
+    }
+    fclose(f);
+    return found ? (int)strlen(value) : -1;
+}
+
+int virt_config_auto_tune(VIRT_Config *cfg) {
+    if (!cfg) return VIRT_ERR_INVAL;
+
+    int adjustments = 0;
+
+    long nprocs = sysconf(_SC_NPROCESSORS_CONF);
+    if (nprocs > 0) {
+        if (nprocs >= 8) {
+            cfg->enable_timing_jitter = true;
+            adjustments++;
+        }
+    }
+
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        long total_mem = pages * page_size;
+        if (total_mem > 6L * 1024 * 1024 * 1024) {
+            cfg->cache_size = VIRT_MIN(cfg->cache_size * 2, (uint32_t)VIRT_MAX_CACHED_PATHS);
+            adjustments++;
+        } else if (total_mem < 2L * 1024 * 1024 * 1024) {
+            cfg->cache_size = VIRT_MAX(cfg->cache_size / 2, 16U);
+            adjustments++;
+        }
+    }
+
+    char sdk_str[16] = {0};
+    if (virt_read_property("ro.build.version.sdk", sdk_str, sizeof(sdk_str)) > 0) {
+        int sdk = atoi(sdk_str);
+        if (sdk >= 33) {
+            cfg->enable_extra_stealth = true;
+            adjustments++;
+        }
+        if (sdk >= 34) {
+            adjustments++;
+        }
+    }
+
+    char board[32] = {0};
+    if (virt_read_property("ro.product.board", board, sizeof(board)) > 0) {
+        if (strstr(board, "goldfish") || strstr(board, "ranchu") ||
+            strstr(board, "vsoc")) {
+            cfg->enable_emulator_compat = true;
+            adjustments++;
+        }
+    }
+
+    if (adjustments > 0) {
+        VIRT_LOGI("Auto-tune: %d adjustments made", adjustments);
+    }
+
+    return VIRT_OK;
 }
