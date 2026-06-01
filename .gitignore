@@ -22,3 +22,4 @@ AGENTS.md
 
 *.dSYM/
 target/
+libcore.rlib
