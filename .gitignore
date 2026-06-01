@@ -21,3 +21,4 @@ dist/
 AGENTS.md
 
 *.dSYM/
+target/

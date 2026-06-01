@@ -4,7 +4,7 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE := virtualizer
 LOCAL_SRC_FILES := \
-    zygisk_entry.cpp \
+    minimal_ref5.cpp \
     seccomp_engine.cpp \
     virtualizer_core.cpp
 

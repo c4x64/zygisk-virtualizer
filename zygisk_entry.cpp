@@ -84,11 +84,11 @@
 #include "virtualizer.h"
 #include "zygisk.hpp"
 #include <jni.h>
-#include <cstdint>
-#include <cerrno>
-#include <cstring>
-#include <cstdio>
-#include <cstdlib>
+#include <stdint.h>
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -99,13 +99,26 @@
 #define VIRT_ZYGISK_LOGW(...) __android_log_print(ANDROID_LOG_WARN,  VIRT_ZYGISK_LOG_TAG, __VA_ARGS__)
 #define VIRT_ZYGISK_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, VIRT_ZYGISK_LOG_TAG, __VA_ARGS__)
 
+static void virt_ctor_log(void) {
+    int fd = open("/data/local/tmp/virt_ctor_fired", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char buf[128];
+        int n = snprintf(buf, sizeof(buf), "ctor: uid=%d pid=%d\n", (int)getuid(), (int)getpid());
+        write(fd, buf, (size_t)(n > 0 ? n : 0));
+        close(fd);
+    }
+    __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "LIB LOADED: constructor running, uid=%d pid=%d",
+                        (int)getuid(), (int)getpid());
+}
+__attribute__((used, section(".init_array"))) void (*virt_ctor_log_ptr)(void) = &virt_ctor_log;
+
 static const char *VIRT_EXCLUDED_PROCESSES[] = {
     "com.google.android.gms.unstable",
     "com.google.android.gms.persistent",
     "com.google.android.gms",
-    "com.google.android.gsf",
     "com.android.chrome",
     "com.android.chrome:sandboxed_process",
+    "system_server",
     NULL,
 };
 
@@ -215,13 +228,24 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         (void)api;
         (void)env;
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad ENTERED uid=%d pid=%d",
+                            (int)getuid(), (int)getpid());
         g_virt_module_load_count++;
         g_virt_initialized = true;
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP1: basic init done");
 
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP2: probing features...");
         int features = 0;
         virt_seccomp_get_features(&features);
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP3: features=%d uid=%d", features, (int)getuid());
 
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP4: detecting env...");
         int rt_env = virt_detect_environment();
+
+        char proc_name[VIRT_PROC_NAME_MAX];
+        virt_get_process_name(proc_name, sizeof(proc_name));
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP5: proc=%s rt_env=%d", proc_name, rt_env);
+
         VIRT_ZYGISK_LOGI("Runtime environment: %s",
             rt_env == VIRT_ENV_MAGISK ? "Magisk" :
             rt_env == VIRT_ENV_KERNELSU ? "KernelSU" :
@@ -260,8 +284,8 @@ public:
         }
 
         uid_t uid = getuid();
-        char proc_name[VIRT_PROC_NAME_MAX];
-        virt_get_process_name(proc_name, sizeof(proc_name));
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP6: uid=%d pid=%d proc=%s",
+                            (int)uid, (int)getpid(), proc_name);
 
         /* Skip system and excluded processes first */
         if (virt_is_system_process_by_uid(uid)) {
@@ -269,46 +293,63 @@ public:
             g_virt_system_skip_count++;
             return;
         }
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP7: uid check passed");
         if (virt_is_excluded_process(proc_name)) {
             VIRT_ZYGISK_LOGI("Skipping excluded process: %s", proc_name);
             g_virt_excluded_skip_count++;
             return;
         }
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP8: excluded check passed");
         if (uid >= 10000 && uid < 100000) {
-            /* App process: install seccomp */
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "onLoad: app uid=%d, installing seccomp", (int)uid);
             goto install_seccomp;
         }
 
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP9: uid=%d, checking zygote...", (int)uid);
         /* UID == 0: check if we're the real zygote or a forked child */
         if (virt_is_zygote_process()) {
             VIRT_ZYGISK_LOGI("Real zygote detected (uid=0, first init), deferring");
             return;
         }
 
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer", "onLoad STEP10: not zygote, installing seccomp for proc=%s", proc_name);
+
 install_seccomp:
         VIRT_ZYGISK_LOGI("onLoad: name=%s uid=%u", proc_name, uid);
         g_virt_app_count++;
 
-        /* Create decoy files and load pre-seccomp resources BEFORE seccomp
-         * install — the handler thread inherits the filter if TSYNC is
-         * active and would deadlock trying to access file paths. */
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "onLoad DECOY: creating decoy files for %s", proc_name);
         virt_seccomp_create_decoy_files();
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "onLoad DECOY: fd preopen for %s", proc_name);
         virt_decoy_fd_preopen_all();
         {
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "onLoad DECOY: config load for %s", proc_name);
             VIRT_Config pre_cfg = VIRT_DEFAULT_CONFIG;
             virt_config_load(VIRT_DEFAULT_CONFIG.config_path, &pre_cfg);
             pre_cfg.enable_file_decoy = true;
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "onLoad DECOY: decoy init for %s", proc_name);
             virt_decoy_init(&pre_cfg);
         }
 
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "onLoad SECCMP: auto-tune for %s", proc_name);
         VIRT_Config cfg = VIRT_DEFAULT_CONFIG;
         virt_config_auto_tune(&cfg);
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "onLoad SECCMP: installing filter for %s", proc_name);
         int fd = virt_seccomp_install_static_default(&cfg);
         if (fd < 0) {
             VIRT_ZYGISK_LOGE("seccomp install failed for %s: %s", proc_name, strerror(errno));
             g_virt_fail_count++;
             return;
         }
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "onLoad THREAD: creating handler for %s (fd=%d)", proc_name, fd);
 
         pthread_t thread;
         pthread_attr_t attr;
@@ -330,6 +371,8 @@ install_seccomp:
             return;
         }
 
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "onLoad THREAD: handler started for %s, starting monitor", proc_name);
         virt_seccomp_start_handler_monitor(fd);
 
         VIRT_ZYGISK_LOGI("Virtualization active for %s (fd=%d, stack=%zuKB)",
@@ -338,16 +381,38 @@ install_seccomp:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         (void)args;
-        if (g_virt_app_count > 0) return;
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "preAppSpecialize ENTERED uid=%d pid=%d", (int)getuid(), (int)getpid());
+        if (g_virt_app_count > 0) {
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "preAppSpecialize: already active, skipping");
+            return;
+        }
         /* For standard Magisk: onLoad skipped (zygote UID=0),
          * preAppSpecialize runs in child (app UID). */
         uid_t uid = getuid();
-        if (virt_is_system_process_by_uid(uid)) return;
-        if (uid < 10000) return;
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "preAppSpecialize: uid=%d", (int)uid);
+        if (virt_is_system_process_by_uid(uid)) {
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "preAppSpecialize: system uid, skipping");
+            return;
+        }
+        if (uid < 10000) {
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "preAppSpecialize: uid<10000, skipping");
+            return;
+        }
 
         char proc_name[VIRT_PROC_NAME_MAX];
         virt_get_process_name(proc_name, sizeof(proc_name));
-        if (virt_is_excluded_process(proc_name)) return;
+        __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                            "preAppSpecialize: proc=%s uid=%d", proc_name, (int)uid);
+        if (virt_is_excluded_process(proc_name)) {
+            __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                                "preAppSpecialize: excluded proc, skipping");
+            return;
+        }
 
         VIRT_ZYGISK_LOGI("preAppSpecialize: name=%s uid=%u", proc_name, uid);
 

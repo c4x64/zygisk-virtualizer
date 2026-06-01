@@ -1429,6 +1429,9 @@ ssize_t virt_seccomp_read_mem(pid_t target_pid, uint64_t remote_addr,
 // @return 0 on clean shutdown, VIRT_ERR on error
 int virt_seccomp_handler_loop(void *arg) {
     int notify_fd = (int)(intptr_t)arg;
+    __android_log_print(ANDROID_LOG_INFO, "Virtualizer",
+                        "handler_loop ENTERED notify_fd=%d pid=%d",
+                        notify_fd, (int)getpid());
     prctl(PR_SET_NAME, "seccomp-virt", 0, 0, 0);
 
     g_handler_timerfd = virt_create_handler_timer();
